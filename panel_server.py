@@ -148,7 +148,21 @@ def merge_secrets(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
 
 
 def public_status() -> dict[str, Any]:
-    state = core.load_json(core.STATE_FILE)
+    try:
+        state = core.load_state()
+    except Exception:
+        state = core.load_json(core.STATE_FILE)
+    last = None
+    with WORKER.lock:
+        last = WORKER.last_result
+    if not last:
+        last = state.get("last")
+    cfg = {}
+    try:
+        cfg = load_cfg()
+    except Exception:
+        pass
+    policy = (cfg.get("policy") or {}) if isinstance(cfg, dict) else {}
     with WORKER.lock:
         return {
             "running": WORKER.running,
@@ -163,6 +177,21 @@ def public_status() -> dict[str, Any]:
             "state_file": str(core.STATE_FILE),
             "history_len": len(state.get("history") or []),
             "last_state": state.get("last"),
+            "cleanup_cursor": state.get("cleanup_cursor"),
+            "policy": {
+                "min_count": policy.get("min_count"),
+                "target_count": policy.get("target_count"),
+                "max_per_cycle": policy.get("max_per_cycle"),
+                "interval_sec": policy.get("interval_sec"),
+            },
+            "snapshot": {
+                "current": (last or {}).get("current") or (last or {}).get("after"),
+                "after": (last or {}).get("after"),
+                "imported": (last or {}).get("imported"),
+                "bound": len((last or {}).get("bound_ids") or []),
+                "bind_ok": (last or {}).get("bind_ok"),
+                "message": (last or {}).get("message"),
+            },
         }
 
 
@@ -195,13 +224,19 @@ def _run_job(kind: str, overrides: dict[str, Any] | None = None) -> dict[str, An
     target.login()
     result = core.run_cycle(cfg, source, target)
 
-    # persist state
-    state = core.load_json(core.STATE_FILE)
+    # persist state via helpers (preserve cursor/streaks)
+    try:
+        state = core.load_state()
+    except Exception:
+        state = core.load_json(core.STATE_FILE)
     history = state.get("history") or []
     history.append(result)
     state["history"] = history[-100:]
     state["last"] = result
-    core.save_json(core.STATE_FILE, state)
+    try:
+        core.save_state(state)
+    except Exception:
+        core.save_json(core.STATE_FILE, state)
     return result
 
 
@@ -245,20 +280,25 @@ def _job_wrapper(kind: str, overrides: dict[str, Any] | None = None) -> None:
 
 def loop_worker() -> None:
     log.info("循环线程启动")
-    while not WORKER.stop_event.is_set():
-        cfg = load_cfg()
-        interval = max(30, int(cfg.get("policy", {}).get("interval_sec") or 300))
-        _job_wrapper("loop-tick")
-        # interruptible sleep
-        for _ in range(interval):
-            if WORKER.stop_event.is_set():
-                break
-            time.sleep(1)
-    with WORKER.lock:
-        WORKER.running = False
-        WORKER.mode = "idle"
-        WORKER.thread = None
-    log.info("循环线程已停止")
+    try:
+        while not WORKER.stop_event.is_set():
+            cfg = load_cfg()
+            interval = max(30, int(cfg.get("policy", {}).get("interval_sec") or 300))
+            _job_wrapper("loop-tick")
+            for _ in range(interval):
+                if WORKER.stop_event.is_set():
+                    break
+                time.sleep(1)
+    finally:
+        with WORKER.lock:
+            WORKER.running = False
+            WORKER.mode = "idle"
+            WORKER.thread = None
+        try:
+            core.release_lock()
+        except Exception:
+            pass
+        log.info("循环线程已停止")
 
 
 # ── FastAPI ────────────────────────────────────────────────────────────────
@@ -356,6 +396,12 @@ def api_loop_start() -> dict[str, Any]:
             return {"ok": True, "message": "已在运行"}
         if WORKER.busy:
             raise HTTPException(409, "有单轮任务在跑，请稍候")
+        # 抢全局单实例锁，避免与 CLI 同时跑
+        if not core.acquire_lock(owner="panel"):
+            raise HTTPException(
+                409,
+                "无法启动：已有 CLI/其他实例占用 .auto_refill.lock，请先停止另一实例",
+            )
         WORKER.stop_event.clear()
         WORKER.running = True
         WORKER.mode = "loop"
@@ -371,6 +417,40 @@ def api_loop_stop() -> dict[str, Any]:
         if not WORKER.running:
             return {"ok": True, "message": "未在运行"}
         WORKER.stop_event.set()
+    log.info("正在停止循环…")
+    return {"ok": True, "message": "已发送停止信号"}
+
+
+@app.post("/api/fix-local")
+def api_fix_local() -> dict[str, Any]:
+    """急救：停止本地卡死注册会话并探测账号页延迟。"""
+    cfg = load_cfg()
+    try:
+        src = core.SourceClient(cfg["source"])
+        src.login()
+        before = src.get_registration_sessions(limit=80, active_only=False)
+        stop = src.stop_all_registrations()
+        time.sleep(1.5)
+        after = src.get_registration_sessions(limit=80, active_only=False)
+        t0 = time.time()
+        page = src.list_accounts(status="active", page=1, page_size=25)
+        ms = int((time.time() - t0) * 1000)
+        out = {
+            "ok": True,
+            "before_total": before.get("total") or len(before.get("sessions") or []),
+            "before_active": before.get("active"),
+            "stop": stop,
+            "after_total": after.get("total") or len(after.get("sessions") or []),
+            "after_active": after.get("active"),
+            "accounts_page_ms": ms,
+            "accounts_total": page.get("total"),
+            "message": f"急救完成：账号页 {ms}ms，注册会话 total={after.get('total')}",
+        }
+        log.info("fix-local: %s", out["message"])
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.exception("fix-local failed")
+        raise HTTPException(500, str(e)) from e
     log.info("正在停止循环…")
     return {"ok": True, "message": "已发送停止信号"}
 
@@ -599,6 +679,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="row">
         <button onclick="testLogin()">测试两边登录</button>
+        <button class="warn" onclick="fixLocal()">急救：停卡死注册</button>
         <button class="ghost" onclick="refreshAll()">刷新状态</button>
         <button class="ghost" onclick="clearLogView()">清空日志视图</button>
       </div>
@@ -991,6 +1072,17 @@ async function testLogin() {
     if (r.target?.ok) $("s-group").textContent = r.target.group_id;
   } catch (e) {
     toast(e.message, false);
+  }
+}
+
+async function fixLocal() {
+  try {
+    toast("正在急救本地注册会话…");
+    const r = await api("/api/fix-local", { method: "POST", body: "{}" });
+    toast(r.message || "急救完成", !!r.ok);
+    refreshAll();
+  } catch (e) {
+    toast("急救失败: " + e.message, false);
   }
 }
 

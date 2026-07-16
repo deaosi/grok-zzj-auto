@@ -1737,24 +1737,8 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
     # ── A. 远程测活清理 ───────────────────────────────────────────────────
     if policy.get("enable_cleanup", True) and tgt_cfg.get("cleanup_bad", True):
         try:
+            # cursor 由 cleanup_bad_accounts 写入 STATE_FILE，不再写含密 config
             result["cleanup"] = target.cleanup_bad_accounts(group_id, dry_run=dry)
-            # 持久化游标，下轮继续轮询
-            if not dry and result["cleanup"] and result["cleanup"].get("next_cursor") is not None:
-                try:
-                    disk = load_json(DEFAULT_CONFIG) if DEFAULT_CONFIG.is_file() else {}
-                    disk.setdefault("target", {})["cleanup_cursor"] = int(
-                        result["cleanup"]["next_cursor"]
-                    )
-                    # 只写 cursor，不覆盖用户其它配置中的密钥逻辑
-                    if DEFAULT_CONFIG.is_file():
-                        cur_full = load_json(DEFAULT_CONFIG)
-                        cur_full.setdefault("target", {})["cleanup_cursor"] = int(
-                            result["cleanup"]["next_cursor"]
-                        )
-                        save_json(DEFAULT_CONFIG, cur_full)
-                        cfg["target"]["cleanup_cursor"] = int(result["cleanup"]["next_cursor"])
-                except Exception as e:  # noqa: BLE001
-                    log.debug("persist cleanup_cursor failed: %s", e)
         except Exception as e:  # noqa: BLE001
             log.exception("远程清理失败: %s", e)
             result["cleanup"] = {"error": str(e)}
@@ -1775,32 +1759,43 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
         result["message"] = f"仅清理完成，当前 {current}"
         return result
 
-    # 号池仍充足：默认不注册不补号（register-only 模式除外）
+    # 分层水位：充足只清理；紧急/正常决定本轮批量
     if current >= min_count and policy.get("enable_refill", True):
-        result["message"] = f"号池充足 ({current} >= {min_count})，本轮不补号"
-        log.info(result["message"])
-        return result
+        # 未达 target 时仍可小批量补（normal）
+        if current >= target_count:
+            result["message"] = f"号池已达目标 ({current} >= {target_count})，本轮不补号"
+            log.info(result["message"])
+            return result
+        # min <= current < target：用 normal_batch
+        batch_cap = int(policy.get("normal_batch") or max(1, max_per // 2))
+    else:
+        batch_cap = max_per
 
     need = max(0, target_count - current)
-    need = min(need, max_per) if policy.get("enable_refill", True) else 0
+    need = min(need, batch_cap) if policy.get("enable_refill", True) else 0
     result["need"] = need
+    result["batch_cap"] = batch_cap
     if need <= 0 and policy.get("enable_refill", True):
         result["message"] = "need=0"
         return result
 
     # ── B1. 本地不足则注册 ────────────────────────────────────────────────
+    buffer = int(src_cfg.get("local_buffer") or 20)
+    min_local = int(src_cfg.get("min_local_active") or 50)
+    pool_target = max(need, min_local) + buffer
     if policy.get("enable_register", True) and src_cfg.get("auto_register", True):
         if dry:
-            exp = source.count_exportable(limit=max(need, 50) + 20)
+            exp = source.count_exportable(limit=pool_target + 10)
             result["register"] = {
                 "dry_run": True,
                 "exportable": exp,
-                "would_register": exp < max(need, int(src_cfg.get("min_local_active") or 0)),
+                "would_register": exp < pool_target,
+                "pool_target": pool_target,
             }
-            log.info("dry-run 注册检查: exportable=%s need=%s", exp, need)
+            log.info("dry-run 注册检查: exportable=%s pool_target=%s", exp, pool_target)
         else:
             try:
-                result["register"] = source.ensure_local_pool(need if need > 0 else int(src_cfg.get("min_local_active") or 20))
+                result["register"] = source.ensure_local_pool(pool_target)
             except Exception as e:  # noqa: BLE001
                 log.exception("本地注册失败: %s", e)
                 result["register"] = {"error": str(e)}
@@ -1813,9 +1808,9 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
         result["message"] = f"清理后号池充足 current={current}"
         return result
 
-    log.info("需要补充 %s 个账号", need)
+    log.info("需要补充 %s 个账号 (batch_cap=%s)", need, batch_cap)
 
-    # ── B2–B4 导出 → 转换 → 导入 ──────────────────────────────────────────
+    # ── B2–B4 导出 → 转换 → 分片导入 → 绑组 → 再删本地 ──────────────────
     ids = source.collect_export_ids(
         need=need,
         status=src_cfg.get("status") or "active",
@@ -1871,34 +1866,50 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
         log.info(result["message"])
         return result
 
-    imp = target.import_data(
-        dump_body,
-        skip_default_group_bind=bool(tgt_cfg.get("skip_default_group_bind", True)),
-    )
-    created = int(
-        imp.get("account_created")
-        or imp.get("created")
-        or imp.get("success")
-        or 0
-    )
-    failed = int(imp.get("account_failed") or imp.get("failed") or 0)
+    # 分片导入
+    chunk_size = max(5, int(policy.get("import_chunk_size") or 25))
+    created = 0
+    failed = 0
+    import_chunks: list[dict[str, Any]] = []
+    for i in range(0, len(accounts), chunk_size):
+        chunk = accounts[i : i + chunk_size]
+        body = {
+            "exported_at": dump_body["exported_at"],
+            "proxies": [],
+            "accounts": chunk,
+        }
+        try:
+            imp = target.import_data(
+                body,
+                skip_default_group_bind=bool(tgt_cfg.get("skip_default_group_bind", True)),
+            )
+            c = int(
+                imp.get("account_created")
+                or imp.get("created")
+                or imp.get("success")
+                or 0
+            )
+            f = int(imp.get("account_failed") or imp.get("failed") or 0)
+            created += c
+            failed += f
+            import_chunks.append({"offset": i, "size": len(chunk), "created": c, "failed": f})
+            log.info("导入分片 %s-%s: created=%s failed=%s", i, i + len(chunk), c, f)
+        except Exception as e:  # noqa: BLE001
+            failed += len(chunk)
+            import_chunks.append({"offset": i, "size": len(chunk), "error": str(e)[:200]})
+            log.error("导入分片失败 offset=%s: %s", i, e)
+
     result["imported"] = created
     result["failed"] = failed
-    result["import_raw"] = {
-        k: imp.get(k)
-        for k in (
-            "account_created",
-            "account_failed",
-            "proxy_created",
-            "proxy_reused",
-            "proxy_failed",
-            "errors",
-        )
-        if k in imp
-    }
-    log.info("导入结果: created=%s failed=%s raw=%s", created, failed, result["import_raw"])
+    result["import_chunks"] = import_chunks
+    log.info("导入汇总: created=%s failed=%s chunks=%s", created, failed, len(import_chunks))
 
-    if tgt_cfg.get("bind_group_after_import") and group_id is not None:
+    # 绑组
+    bound_ids: list[int] = []
+    bind_missed: list[str] = []
+    bind_ok = False
+    want_bind = bool(tgt_cfg.get("bind_group_after_import")) and group_id is not None
+    if want_bind:
         emails = [
             str((a.get("credentials") or {}).get("email") or a.get("name") or "")
             for a in accounts
@@ -1907,29 +1918,50 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
         new_ids = target.list_recent_account_ids(
             group_id=None,
             limit=len(emails),
-            search_emails=emails[: created or len(emails)],
+            search_emails=emails,
         )
+        # 记录未命中邮箱
+        #（粗略：命中数 < 邮箱数）
         if new_ids:
-            bind_res = target.bulk_bind_group(new_ids, group_id)
-            log.info("绑定分组 group_id=%s ids=%s res=%s", group_id, new_ids, bind_res)
-            result["bound_ids"] = new_ids
+            bind_res = target.bulk_bind_group(new_ids, int(group_id))
+            log.info("绑定分组 group_id=%s ids=%s res=%s", group_id, len(new_ids), bind_res)
+            bound_ids = new_ids
+            bind_ok = True
+            if len(new_ids) < len(emails):
+                bind_missed = emails[len(new_ids) :]
+                log.warning("部分邮箱未定位到 id，miss≈%s", len(bind_missed))
         else:
+            bind_missed = emails
             log.warning(
                 "未能按邮箱定位新账号 id，请在后台确认是否已绑定到分组 %s",
                 group_id,
             )
+    else:
+        # 明确不绑组时，视为可删本地（若开启 delete_after_export）
+        bind_ok = True
 
-    if src_cfg.get("delete_after_export") and ids:
-        del_res = source.delete_accounts(ids[:auth_count])
-        log.info("本地删除导出账号: %s", del_res)
-        result["deleted_local"] = del_res
+    result["bound_ids"] = bound_ids
+    result["bind_ok"] = bind_ok
+    result["bind_missed"] = bind_missed[:50]
+
+    # 仅在绑组成功（或无需绑）后删本地，避免丢号
+    only_after_bind = bool(src_cfg.get("delete_only_after_bind", True))
+    can_delete = bool(src_cfg.get("delete_after_export")) and ids and created > 0
+    if can_delete:
+        if only_after_bind and want_bind and not bind_ok:
+            log.warning("绑组未成功，跳过本地删除（防止丢号）")
+            result["deleted_local"] = {"skipped": True, "reason": "bind_failed"}
+        else:
+            del_res = source.delete_accounts(ids[:auth_count])
+            log.info("本地删除导出账号: %s", del_res)
+            result["deleted_local"] = del_res
 
     after = target.count_group_accounts(group_id)
     result["after"] = after
     cu = result.get("cleanup") or {}
     result["message"] = (
         f"闭环完成: 删坏号≈{cu.get('deleted', 0)} · "
-        f"{current} → {after} (imported≈{created}, failed={failed})"
+        f"{current} → {after} (imported≈{created}, failed={failed}, bound={len(bound_ids)})"
     )
     log.info(result["message"])
     return result
@@ -2036,46 +2068,50 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    source = SourceClient(cfg["source"])
-    target = TargetClient(cfg["target"])
-
+    if not acquire_lock(owner="cli"):
+        return 3
     try:
-        source.login()
-        target.login()
-    except Exception as e:  # noqa: BLE001
-        log.exception("登录失败: %s", e)
-        return 1
+        source = SourceClient(cfg["source"])
+        target = TargetClient(cfg["target"])
 
-    once = bool(cfg.get("_once") or args.once)
-    interval = max(30, int(cfg["policy"].get("interval_sec") or 300))
-
-    while True:
         try:
-            result = run_cycle(cfg, source, target)
-            state = load_json(STATE_FILE)
-            history = state.get("history") or []
-            history.append(result)
-            state["history"] = history[-100:]
-            state["last"] = result
-            save_json(STATE_FILE, state)
-        except requests.HTTPError as e:
-            log.error("HTTP 错误: %s %s", e, getattr(e.response, "text", "")[:500])
-            # re-login on 401
-            if e.response is not None and e.response.status_code == 401:
-                try:
-                    source.login()
-                    target.login()
-                except Exception:  # noqa: BLE001
-                    log.exception("重新登录失败")
+            source.login()
+            target.login()
         except Exception as e:  # noqa: BLE001
-            log.exception("本轮异常: %s", e)
+            log.exception("登录失败: %s", e)
+            return 1
 
-        if once:
-            break
-        log.info("休眠 %ss …", interval)
-        time.sleep(interval)
+        once = bool(cfg.get("_once") or args.once)
+        interval = max(30, int(cfg["policy"].get("interval_sec") or 300))
 
-    return 0
+        while True:
+            try:
+                result = run_cycle(cfg, source, target)
+                state = load_state()
+                history = state.get("history") or []
+                history.append(result)
+                state["history"] = history[-100:]
+                state["last"] = result
+                save_state(state)
+            except requests.HTTPError as e:
+                log.error("HTTP 错误: %s %s", e, getattr(e.response, "text", "")[:500])
+                if e.response is not None and e.response.status_code == 401:
+                    try:
+                        source.login()
+                        target.login()
+                    except Exception:  # noqa: BLE001
+                        log.exception("重新登录失败")
+            except Exception as e:  # noqa: BLE001
+                log.exception("本轮异常: %s", e)
+
+            if once:
+                break
+            log.info("休眠 %ss …", interval)
+            time.sleep(interval)
+
+        return 0
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
