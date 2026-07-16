@@ -164,10 +164,15 @@ def public_status() -> dict[str, Any]:
         pass
     policy = (cfg.get("policy") or {}) if isinstance(cfg, dict) else {}
     with WORKER.lock:
+        mode = WORKER.mode
+        if (not WORKER.running) and WORKER.busy:
+            mode = "stopping"
+        elif (not WORKER.running) and not WORKER.busy:
+            mode = "idle"
         return {
             "running": WORKER.running,
             "busy": WORKER.busy,
-            "mode": WORKER.mode,
+            "mode": mode,
             "cycle_count": WORKER.cycle_count,
             "started_at": WORKER.started_at,
             "finished_at": WORKER.finished_at,
@@ -312,26 +317,35 @@ def _job_wrapper(kind: str, overrides: dict[str, Any] | None = None) -> None:
     finally:
         with WORKER.lock:
             WORKER.busy = False
+            WORKER.finished_at = time.time()
             if not WORKER.running:
                 WORKER.mode = "idle"
-            WORKER.finished_at = time.time()
+            elif WORKER.mode == "loop":
+                WORKER.mode = "loop"
 
 
 def loop_worker() -> None:
     log.info("循环线程启动")
     try:
         while not WORKER.stop_event.is_set():
+            # re-check flag each cycle
+            with WORKER.lock:
+                if not WORKER.running or WORKER.stop_event.is_set():
+                    break
             cfg = load_cfg()
             interval = max(30, int(cfg.get("policy", {}).get("interval_sec") or 300))
+            if WORKER.stop_event.is_set() or not WORKER.running:
+                break
             _job_wrapper("loop-tick")
             for _ in range(interval):
-                if WORKER.stop_event.is_set():
+                if WORKER.stop_event.is_set() or not WORKER.running:
                     break
                 time.sleep(1)
     finally:
         with WORKER.lock:
             WORKER.running = False
-            WORKER.mode = "idle"
+            if not WORKER.busy:
+                WORKER.mode = "idle"
             WORKER.thread = None
         try:
             core.release_lock()
@@ -452,12 +466,35 @@ def api_loop_start() -> dict[str, Any]:
 
 @app.post("/api/loop/stop")
 def api_loop_stop() -> dict[str, Any]:
+    """Stop loop as soon as possible and force UI state back to idle."""
     with WORKER.lock:
-        if not WORKER.running:
-            return {"ok": True, "message": "未在运行"}
+        was_running = bool(WORKER.running)
+        was_busy = bool(WORKER.busy)
         WORKER.stop_event.set()
-    log.info("正在停止循环…")
-    return {"ok": True, "message": "已发送停止信号"}
+        WORKER.running = False
+        # if no job mid-flight, force idle immediately
+        if not WORKER.busy:
+            WORKER.mode = "idle"
+            WORKER.thread = None
+    # best-effort release single-instance lock
+    try:
+        core.release_lock()
+    except Exception:
+        pass
+    if was_running:
+        log.info("循环已停止（busy=%s）", was_busy)
+        msg = "循环已停止" if not was_busy else "已停止循环；当前任务结束后进入空闲"
+    else:
+        msg = "当前未在循环运行"
+        log.info(msg)
+    return {
+        "ok": True,
+        "message": msg,
+        "was_running": was_running,
+        "busy": was_busy,
+        "running": False,
+        "mode": "idle" if not was_busy else "stopping",
+    }
 
 
 @app.post("/api/fix-local")
@@ -1039,7 +1076,7 @@ function setButtons(st) {
   const busy = !!st.busy || _busyUi;
   const running = !!st.running;
   if ($("btn-loop-start")) $("btn-loop-start").disabled = running || busy;
-  if ($("btn-loop-stop")) $("btn-loop-stop").disabled = !running && !busy ? true : !running;
+  if ($("btn-loop-stop")) $("btn-loop-stop").disabled = false; // always clickable
   if ($("btn-run-full")) $("btn-run-full").disabled = busy || running;
 }
 
@@ -1048,13 +1085,12 @@ async function refreshStatus() {
     const st = await api("/api/status");
     const dot = $("status-dot");
     dot.className = "dot" + (st.busy ? " busy" : st.running ? " on" : st.last_error ? " err" : "");
-    $("status-text").textContent = st.busy
-      ? `运行中 · ${st.mode}`
-      : st.running
-        ? "循环待命 / 间隔等待"
-        : st.last_error
-          ? "出错"
-          : "空闲";
+    let statusText = "空闲";
+    if (st.mode === "stopping" || (!st.running && st.busy)) statusText = "正在停止（当前任务收尾中）";
+    else if (st.busy) statusText = `运行中 · ${st.mode}`;
+    else if (st.running) statusText = "循环待命 / 间隔等待";
+    else if (st.last_error) statusText = "出错";
+    $("status-text").textContent = statusText;
     $("s-mode").textContent = st.mode || "idle";
     $("s-cycles").textContent = st.cycle_count ?? 0;
     const last = st.last_result || st.last_state || {};
@@ -1159,7 +1195,13 @@ async function loopStop() {
   try {
     setActionBusy(true, "正在停止循环…");
     const r = await api("/api/loop/stop", { method: "POST", body: "{}" });
-    toast(r.message || "已请求停止循环", true);
+    toast(r.message || "循环已停止", true);
+    // force local UI idle immediately
+    if ($("status-text")) $("status-text").textContent = "空闲";
+    if ($("status-dot")) $("status-dot").className = "dot";
+    if ($("s-mode")) $("s-mode").textContent = "idle";
+    if ($("btn-loop-start")) $("btn-loop-start").disabled = false;
+    if ($("btn-run-full")) $("btn-run-full").disabled = false;
     await refreshStatus();
   } catch (e) {
     toast("停止失败: " + e.message, false);

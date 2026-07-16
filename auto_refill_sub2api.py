@@ -45,6 +45,19 @@ DEFAULT_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 log = logging.getLogger("auto_refill")
 
 
+def interruptible_sleep(seconds: float, should_stop=None) -> bool:
+    """Sleep up to seconds; return True if stopped early.
+    should_stop: optional callable -> bool
+    """
+    end = time.time() + max(0.0, float(seconds))
+    while time.time() < end:
+        if callable(should_stop) and should_stop():
+            return True
+        time.sleep(min(1.0, max(0.05, end - time.time())))
+    return False
+
+
+
 # ── process lock / state helpers ───────────────────────────────────────────
 
 def _pid_alive(pid: int) -> bool:
@@ -323,6 +336,9 @@ def default_config() -> dict[str, Any]:
             "cleanup_fail_delete": True,
             # 同一账号连续失败几轮才删除（1=立刻删）
             "cleanup_fail_streak": 2,
+            "cleanup_delete_unschedulable": True,
+            "cleanup_delete_error_message": True,
+            "cleanup_metadata_max": 100,
             # 游标改存 .auto_refill_state.json（此处仅兼容读旧配置）
             "cleanup_cursor": 0,
             # 优先测这些状态（空=只按 active/全部分页）
@@ -1063,7 +1079,7 @@ class SourceClient:
                     "rate_limited" in msg.lower() or "rate limit" in msg.lower() or "400" in msg
                 ):
                     log.warning("注册启动失败: %s；%ss 后重试", msg[:160], backoff * attempt)
-                    time.sleep(backoff * attempt)
+                    interruptible_sleep(backoff * attempt)
                     continue
                 raise
 
@@ -1130,7 +1146,7 @@ class SourceClient:
                         "检测到 rate_limited（session），退避 %ss 后重试…",
                         backoff * attempt,
                     )
-                    time.sleep(backoff * attempt)
+                    interruptible_sleep(backoff * attempt)
                     continue
                 break
 
@@ -1160,13 +1176,13 @@ class SourceClient:
                     "批次 rate_limited 且 ok=0，退避 %ss 后以更小批量重试…",
                     backoff * attempt,
                 )
-                time.sleep(backoff * attempt)
+                interruptible_sleep(backoff * attempt)
                 continue
             break
 
         settle = int(self.cfg.get("register_settle_sec") or 30)
         log.info("注册结束，等待 settle %ss 以便 probe 完成…", settle)
-        time.sleep(max(0, settle))
+        interruptible_sleep(max(0, settle))
         out["exportable_after"] = self.count_exportable(limit=scan_limit)
         out["message"] = (
             f"注册结束 exportable {out['exportable_before']}→{out.get('exportable_after')}"
@@ -1491,6 +1507,121 @@ class TargetClient:
             "ok": r.status_code in (200, 204),
             "body": self._unwrap(body) if isinstance(body, dict) else body,
         }
+
+
+    def _account_unusable_reason(self, acc: dict[str, Any]) -> str | None:
+        """Heuristic: account clearly unusable from list metadata."""
+        if not isinstance(acc, dict):
+            return None
+        status = str(acc.get("status") or "").lower()
+        if status in {"inactive", "error", "expired", "disabled", "quota_exhausted", "banned", "invalid"}:
+            return f"status={status}"
+        if acc.get("schedulable") is False:
+            return "not_schedulable"
+        err = acc.get("error_message") or acc.get("last_error") or acc.get("error")
+        if err:
+            msg = str(err).strip()
+            if msg:
+                return f"error_message:{msg[:80]}"
+        exp = acc.get("expires_at")
+        try:
+            if isinstance(exp, (int, float)):
+                ts = float(exp)
+                if ts > 1e12:
+                    ts /= 1000.0
+                if ts and ts < time.time() - 3600:
+                    return "expires_at_past"
+        except Exception:
+            pass
+        return None
+
+    def cleanup_unusable_metadata(
+        self,
+        group_id: int | None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete accounts clearly bad by metadata (no live test needed)."""
+        max_n = max(0, int(self.cfg.get("cleanup_metadata_max") or 100))
+        del_unsched = bool(self.cfg.get("cleanup_delete_unschedulable", True))
+        del_errmsg = bool(self.cfg.get("cleanup_delete_error_message", True))
+        stats: dict[str, Any] = {
+            "scanned": 0,
+            "candidates": 0,
+            "deleted": 0,
+            "delete_failed": 0,
+            "items": [],
+            "dry_run": dry_run,
+        }
+        if max_n <= 0:
+            return stats
+
+        pages: list[dict[str, Any]] = []
+        for status in ("active", ""):
+            try:
+                for page in range(1, 9):
+                    rows = self._list_group_page(
+                        group_id, status=status, page=page, page_size=50
+                    )
+                    if not rows:
+                        break
+                    pages.extend(rows)
+                    if len(pages) >= 400:
+                        break
+            except Exception as e:  # noqa: BLE001
+                log.debug("metadata scan status=%s failed: %s", status, e)
+
+        seen: set[int] = set()
+        accounts: list[dict[str, Any]] = []
+        for a in pages:
+            if not isinstance(a, dict) or a.get("id") is None:
+                continue
+            aid = int(a["id"])
+            if aid in seen:
+                continue
+            seen.add(aid)
+            accounts.append(a)
+        stats["scanned"] = len(accounts)
+
+        for acc in accounts:
+            reason = self._account_unusable_reason(acc)
+            if not reason:
+                continue
+            if reason == "not_schedulable" and not del_unsched:
+                continue
+            if reason.startswith("error_message") and not del_errmsg:
+                continue
+            stats["candidates"] += 1
+            aid = int(acc["id"])
+            name = acc.get("name") or acc.get("email") or aid
+            item: dict[str, Any] = {"id": aid, "name": name, "reason": reason}
+            if dry_run:
+                stats["items"].append(item)
+                if stats["candidates"] >= max_n:
+                    break
+                continue
+            d = self.delete_account(aid)
+            if d.get("ok"):
+                stats["deleted"] += 1
+                item["deleted"] = True
+                log.info("元数据清理删除 id=%s name=%s reason=%s", aid, name, reason)
+            else:
+                stats["delete_failed"] += 1
+                item["deleted"] = False
+                log.warning("元数据清理删除失败 id=%s %s", aid, d)
+            stats["items"].append(item)
+            if stats["candidates"] >= max_n:
+                break
+
+        log.info(
+            "元数据清理: scanned=%s candidates=%s deleted=%s failed=%s dry_run=%s",
+            stats["scanned"],
+            stats["candidates"],
+            stats["deleted"],
+            stats["delete_failed"],
+            dry_run,
+        )
+        return stats
 
     def _pick_cleanup_batch(
         self,
@@ -1898,7 +2029,20 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
     if policy.get("enable_cleanup", True) and tgt_cfg.get("cleanup_bad", True):
         try:
             # cursor 由 cleanup_bad_accounts 写入 STATE_FILE，不再写含密 config
-            result["cleanup"] = target.cleanup_bad_accounts(group_id, dry_run=dry)
+            meta = target.cleanup_unusable_metadata(group_id, dry_run=dry)
+            live = target.cleanup_bad_accounts(group_id, dry_run=dry)
+            result["cleanup"] = {
+                "metadata": meta,
+                "live_test": live,
+                "deleted": int(meta.get("deleted") or 0) + int(live.get("deleted") or 0),
+                "tested": live.get("tested"),
+                "ok": live.get("ok"),
+                "bad": live.get("bad"),
+                "soft_bad": live.get("soft_bad"),
+                "errors": live.get("errors"),
+                "next_cursor": live.get("next_cursor"),
+                "dry_run": dry,
+            }
         except Exception as e:  # noqa: BLE001
             log.exception("远程清理失败: %s", e)
             result["cleanup"] = {"error": str(e)}
