@@ -287,22 +287,24 @@ def default_config() -> dict[str, Any]:
             "local_buffer": 20,
             # 自动注册
             "auto_register": True,
-            "register_count": 3,  # 每次注册数量（local + 防 rate_limited 建议 1~5）
-            "register_concurrency": 1,  # 本地 camoufox / xAI device 建议 1
-            "register_stagger_ms": 1200,
-            "register_probe_delay_sec": 30,
+            "register_count": 8,  # 稳速：8 个/批（够数会提前结束等待）
+            "register_concurrency": 2,  # 稳速甜蜜点（3+ 失败率明显升）
+            "register_stagger_ms": 700,
+            "register_probe_delay_sec": 20,
             # 空 body 会用后台已保存的 registration_config（邮件/打码/代理）
             "register_body": {},
-            "register_poll_interval_sec": 10,
-            "register_timeout_sec": 1800,
+            "register_poll_interval_sec": 8,
+            "register_timeout_sec": 900,
             # 注册完成后等待秒数再导出（给 probe 时间）
-            "register_settle_sec": 30,
+            "register_settle_sec": 15,
             # 注册前检查本地是否过载；过载则跳过本轮注册
             "register_health_gate": True,
-            "register_max_active_sessions": 4,
+            "register_max_active_sessions": 6,
             # rate_limited 退避
             "register_rate_limit_retries": 3,
-            "register_rate_limit_backoff_sec": 90,
+            "register_rate_limit_backoff_sec": 60,
+            # 达到 need 后提前结束等待（不必等整批失败会话）
+            "register_early_stop_ok": 0,  # 0=自动按 deficit
             "register_max_cpu_skip": False,
         },
         # 远程 sub2api（号池目标）
@@ -836,12 +838,22 @@ class SourceClient:
         except Exception as e:  # noqa: BLE001
             log.warning("load register config for start body failed: %s", e)
 
-        n = int(count if count is not None else (self.cfg.get("register_count") or 3))
-        n = max(1, min(n, 10))  # hard safety for local captcha / xAI rate limits
+        n = int(count if count is not None else (self.cfg.get("register_count") or 8))
+        n = max(1, min(n, 20))  # hard safety cap per batch (local turnstile)
         body["count"] = n
-        body["concurrency"] = max(1, min(2, int(self.cfg.get("register_concurrency") or 1)))
-        body["stagger_ms"] = int(self.cfg.get("register_stagger_ms") or 1200)
-        body["probe_delay_sec"] = int(self.cfg.get("register_probe_delay_sec") or 30)
+        # sweet spot: 2 is usually faster+stabler than 3~5 under local camoufox
+        body["concurrency"] = max(1, min(3, int(self.cfg.get("register_concurrency") or 2)))
+        body["stagger_ms"] = int(self.cfg.get("register_stagger_ms") or 700)
+        body["probe_delay_sec"] = int(self.cfg.get("register_probe_delay_sec") or 20)
+        # force local turnstile — mis-set yescaptcha causes long timeouts & "no progress"
+        body["captcha_provider"] = "local"
+        body["local_solver_url"] = (
+            body.get("local_solver_url")
+            or "http://127.0.0.1:5072"
+        )
+        # clear fake yescaptcha key "local" which confuses provider fallbacks
+        if str(body.get("yescaptcha_key") or "").strip().lower() in {"", "local"}:
+            body.pop("yescaptcha_key", None)
 
         r = self.s.post(
             f"{self.base}/admin/api/accounts/register-email",
@@ -953,8 +965,11 @@ class SourceClient:
         batch_id: str,
         *,
         timeout_sec: int = 1800,
-        poll_sec: int = 10,
+        poll_sec: int = 8,
+        min_ok: int | None = None,
+        stop_when_enough: bool = True,
     ) -> dict[str, Any]:
+        """Poll batch until terminal, timeout, or enough successes (early stop)."""
         terminal = {
             "done",
             "finished",
@@ -968,6 +983,7 @@ class SourceClient:
         }
         started = time.time()
         last: dict[str, Any] = {}
+        enough_n = int(min_ok) if min_ok is not None else 0
         while time.time() - started < timeout_sec:
             try:
                 last = self.get_registration_batch(batch_id)
@@ -980,17 +996,44 @@ class SourceClient:
             count = int(last.get("count") or last.get("total") or 0)
             ok_c = int(last.get("ok_count") or last.get("imported") or 0)
             fail_c = int(last.get("fail_count") or 0)
+            inflight = last.get("inflight")
             log.info(
-                "注册批次 %s status=%s finished=%s/%s ok=%s fail=%s",
+                "注册批次 %s status=%s finished=%s/%s ok=%s fail=%s inflight=%s",
                 batch_id,
                 st,
                 finished,
                 count,
                 ok_c,
                 fail_c,
+                inflight,
             )
             if self._looks_rate_limited(last):
                 last["rate_limited"] = True
+            # Early success: enough imported accounts — stop waiting on slow failures
+            if stop_when_enough and enough_n > 0 and ok_c >= enough_n:
+                last["early_stop"] = True
+                last["early_stop_reason"] = f"ok_count {ok_c} >= min_ok {enough_n}"
+                log.info(
+                    "注册批次 %s 已够数 ok=%s>=%s，提前结束等待并停止剩余会话",
+                    batch_id,
+                    ok_c,
+                    enough_n,
+                )
+                try:
+                    # stop leftover workers so next cycle can start faster
+                    self.s.post(
+                        f"{self.base}/admin/api/accounts/register-email/batches/"
+                        f"{batch_id}/stop",
+                        headers={**self._headers(), "Content-Type": "application/json"},
+                        json={},
+                        timeout=30,
+                    )
+                except Exception:
+                    try:
+                        self.stop_all_registrations()
+                    except Exception:
+                        pass
+                return last
             if st in terminal or (
                 count > 0
                 and finished >= count
@@ -998,6 +1041,13 @@ class SourceClient:
             ):
                 return last
             if last.get("runner_alive") is False and count and finished >= count:
+                return last
+            # if all remaining look doomed (high fail, no inflight) end early
+            if (
+                count > 0
+                and inflight == 0
+                and finished >= count
+            ):
                 return last
             time.sleep(max(3, poll_sec))
         last["timeout"] = True
@@ -1050,22 +1100,31 @@ class SourceClient:
             out["message"] = f"本地可导出 {exportable} >= {threshold}"
             return out
 
-        # keep batches tiny to reduce xAI device rate limits
-        base_count = max(1, min(int(self.cfg.get("register_count") or 3), 10))
+        # keep batches moderate for local turnstile (faster than 1, stabler than 15x3)
+        base_count = max(1, min(int(self.cfg.get("register_count") or 8), 15))
         deficit = max(1, threshold - exportable)
-        reg_n = min(base_count, deficit, 10)
+        reg_n = min(base_count, max(deficit, 4))
         retries = max(1, int(self.cfg.get("register_rate_limit_retries") or 3))
-        backoff = max(30, int(self.cfg.get("register_rate_limit_backoff_sec") or 90))
+        backoff = max(30, int(self.cfg.get("register_rate_limit_backoff_sec") or 60))
+        # stop waiting once we have enough for this cycle (+small buffer)
+        min_ok_target = max(1, min(deficit, reg_n, int(self.cfg.get("register_early_stop_ok") or deficit)))
 
         for attempt in range(1, retries + 1):
-            this_n = 1 if attempt > 1 else reg_n
+            # on retry after rate limit / high fail: smaller batch + lower concurrency temporarily
+            if attempt == 1:
+                this_n = reg_n
+            elif attempt == 2:
+                this_n = max(2, min(4, reg_n))
+            else:
+                this_n = 1
             log.info(
-                "本地可导出不足 (%s < %s)，注册 attempt %s/%s ×%s",
+                "本地可导出不足 (%s < %s)，注册 attempt %s/%s ×%s (min_ok≈%s)",
                 exportable,
                 threshold,
                 attempt,
                 retries,
                 this_n,
+                min_ok_target,
             )
             try:
                 started = self.start_registration(this_n)
@@ -1156,21 +1215,31 @@ class SourceClient:
 
             batch = self.wait_registration(
                 str(batch_id),
-                timeout_sec=int(self.cfg.get("register_timeout_sec") or 1800),
-                poll_sec=int(self.cfg.get("register_poll_interval_sec") or 10),
+                timeout_sec=int(self.cfg.get("register_timeout_sec") or 900),
+                poll_sec=int(self.cfg.get("register_poll_interval_sec") or 8),
+                min_ok=max(1, min(min_ok_target, this_n)),
+                stop_when_enough=True,
             )
             ok_c = int(batch.get("ok_count") or batch.get("imported") or 0)
+            fail_c = int(batch.get("fail_count") or 0)
             rate_hit = self._looks_rate_limited(batch)
+            early = bool(batch.get("early_stop"))
             out["batch"] = {
                 "status": batch.get("status") or batch.get("batch_status"),
                 "finished": batch.get("finished"),
                 "ok_count": ok_c,
-                "fail_count": batch.get("fail_count"),
+                "fail_count": fail_c,
                 "timeout": batch.get("timeout"),
                 "rate_limited": rate_hit,
+                "early_stop": early,
+                "early_stop_reason": batch.get("early_stop_reason"),
                 "spawn_errors": (batch.get("spawn_errors") or [])[:5],
                 "message": batch.get("message"),
             }
+            # enough successes — proceed to export even if batch not fully finished
+            if ok_c >= max(1, min(min_ok_target, this_n)) or early:
+                log.info("注册已获得足够成功账号 ok=%s，进入 settle/导出", ok_c)
+                break
             if rate_hit and ok_c <= 0 and attempt < retries:
                 log.warning(
                     "批次 rate_limited 且 ok=0，退避 %ss 后以更小批量重试…",
@@ -1178,9 +1247,19 @@ class SourceClient:
                 )
                 interruptible_sleep(backoff * attempt)
                 continue
+            # high fail ratio with zero success -> retry smaller
+            if ok_c == 0 and fail_c >= max(2, this_n // 2) and attempt < retries:
+                log.warning(
+                    "注册成功率过低 ok=%s fail=%s，退避 %ss 后重试…",
+                    ok_c,
+                    fail_c,
+                    backoff * attempt,
+                )
+                interruptible_sleep(backoff * attempt)
+                continue
             break
 
-        settle = int(self.cfg.get("register_settle_sec") or 30)
+        settle = int(self.cfg.get("register_settle_sec") or 15)
         log.info("注册结束，等待 settle %ss 以便 probe 完成…", settle)
         interruptible_sleep(max(0, settle))
         out["exportable_after"] = self.count_exportable(limit=scan_limit)

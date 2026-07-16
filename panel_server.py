@@ -216,10 +216,10 @@ def _run_job(kind: str, overrides: dict[str, Any] | None = None) -> dict[str, An
         cfg["policy"]["enable_cleanup"] = False
         cfg["policy"]["enable_register"] = True
         cfg["policy"]["enable_refill"] = False
-        # panel "仅注册": always 1 account / concurrency 1 to avoid rate_limited silence
+        # panel "仅注册": medium batch for speed; still capped
         cfg.setdefault("source", {})
-        cfg["source"]["register_count"] = 1
-        cfg["source"]["register_concurrency"] = 1
+        cfg["source"]["register_count"] = min(10, int(cfg["source"].get("register_count") or 5) or 5)
+        cfg["source"]["register_concurrency"] = min(3, int(cfg["source"].get("register_concurrency") or 2) or 2)
     elif kind == "refill":
         cfg.setdefault("policy", {})
         cfg["policy"]["enable_cleanup"] = False
@@ -749,7 +749,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="row">
         <button class="warn" onclick="run('cleanup')">仅清理远程坏号</button>
-        <button onclick="run('register')">仅本地注册（默认1个）</button>
+        <button onclick="run('register')">仅本地注册（快速）</button>
         <button onclick="run('refill')">仅补号（含注册）</button>
         <button class="ghost" onclick="run('full', true)">模拟运行（不删不导）</button>
       </div>
@@ -829,11 +829,11 @@ PANEL_HTML = r"""<!DOCTYPE html>
             <input id="f-interval" type="number" placeholder="例如 180" />
           </div>
           <div>
-            <label>本地每次注册数量（建议1~3，防 rate_limited）</label>
+            <label>本地每次注册数量（提速可 10~20；限流会自动降速）</label>
             <input id="f-reg-count" type="number" placeholder="例如 3" />
           </div>
           <div>
-            <label>本地注册并发（建议1）</label>
+            <label>本地注册并发（提速可 3~5；不稳再降）</label>
             <input id="f-reg-conc" type="number" placeholder="例如 1" />
           </div>
           <div>
@@ -964,8 +964,8 @@ function fillForm(cfg) {
   $("f-target").value = p.target_count ?? 500;
   $("f-max").value = p.max_per_cycle ?? 50;
   $("f-interval").value = p.interval_sec ?? 180;
-  $("f-reg-count").value = s.register_count ?? 3;
-  if ($("f-reg-conc")) $("f-reg-conc").value = s.register_concurrency ?? 1;
+  $("f-reg-count").value = s.register_count ?? 10;
+  if ($("f-reg-conc")) $("f-reg-conc").value = s.register_concurrency ?? 3;
   $("f-clean-workers").value = t.cleanup_workers ?? 6;
   if ($("f-clean-max")) $("f-clean-max").value = t.cleanup_max ?? 60;
   if ($("f-clean-timeout")) $("f-clean-timeout").value = t.cleanup_timeout_sec ?? 45;
@@ -980,8 +980,8 @@ function collectFormPatch() {
   const patch = {
     source: {
       base_url: $("f-src-url").value.trim(),
-      register_count: Math.max(1, Math.min(10, Number($("f-reg-count").value || 3))),
-      register_concurrency: Math.max(1, Math.min(2, Number(($("f-reg-conc") && $("f-reg-conc").value) || 1))),
+      register_count: Math.max(1, Math.min(30, Number($("f-reg-count").value || 10))),
+      register_concurrency: Math.max(1, Math.min(5, Number(($("f-reg-conc") && $("f-reg-conc").value) || 3))),
       auto_register: $("f-register").checked,
       delete_after_export: $("f-del-local").checked,
     },

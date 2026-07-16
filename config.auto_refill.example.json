@@ -9,19 +9,25 @@
     "export_batch_size": 50,
     "delete_after_export": true,
     "delete_only_after_bind": true,
-    "min_local_active": 50,
-    "local_buffer": 20,
+    "min_local_active": 30,
+    "local_buffer": 15,
     "auto_register": true,
-    "register_count": 40,
+    "register_count": 8,
     "register_concurrency": 2,
-    "register_stagger_ms": 800,
-    "register_probe_delay_sec": 30,
-    "register_body": {},
+    "register_stagger_ms": 700,
+    "register_probe_delay_sec": 20,
+    "register_body": {
+      "captcha_provider": "local",
+      "local_solver_url": "http://127.0.0.1:5072"
+    },
     "register_poll_interval_sec": 15,
-    "register_timeout_sec": 3600,
-    "register_settle_sec": 45,
+    "register_timeout_sec": 900,
+    "register_settle_sec": 15,
     "register_health_gate": true,
-    "register_max_active_sessions": 8
+    "register_max_active_sessions": 8,
+    "register_rate_limit_retries": 3,
+    "register_rate_limit_backoff_sec": 60,
+    "register_early_stop_ok": 0
   },
   "target": {
     "base_url": "https://fd.diamondruby.xyz",
@@ -42,15 +48,20 @@
     "cleanup_fail_delete": true,
     "cleanup_fail_streak": 2,
     "cleanup_page_size": 100,
-    "cleanup_prefer_status": ["error", "inactive", "expired", "quota_exhausted"]
+    "cleanup_prefer_status": [
+      "error",
+      "inactive",
+      "expired",
+      "quota_exhausted"
+    ]
   },
   "policy": {
-    "min_count": 300,
-    "target_count": 500,
-    "max_per_cycle": 50,
-    "normal_batch": 25,
-    "interval_sec": 180,
-    "import_chunk_size": 25,
+    "min_count": 500,
+    "target_count": 1000,
+    "max_per_cycle": 60,
+    "normal_batch": 40,
+    "interval_sec": 90,
+    "import_chunk_size": 30,
     "concurrency": 1,
     "priority": 1,
     "rate_multiplier": 1.0,
