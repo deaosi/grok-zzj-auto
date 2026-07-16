@@ -1,0 +1,2082 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+全自动号池闭环：sub2api Grok 分组 ⇄ 本地 grok2api 注册/导出
+
+完整流程（每轮）：
+  A. 远程清理：遍历目标分组账号，POST /admin/accounts/{id}/test
+     - 非 200 / success=false → 自动 DELETE 删除
+  B. 统计远程可用数；若 < min_count：
+     B1. 本地可用验活账号不足时 → 触发协议注册补源
+         POST /admin/api/accounts/register-email，轮询 batch 直到完成
+     B2. 从本地导出 active + last_probe.ok 账号
+     B3. 转 sub2api 格式并 POST /api/v1/admin/accounts/data 导入
+     B4. 可选绑定 group_id；可选本地删除已导出账号
+
+配置：同目录 config.auto_refill.json。敏感信息勿提交仓库。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+
+# ── defaults ───────────────────────────────────────────────────────────────
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPT_DIR / "config.auto_refill.json"
+STATE_FILE = SCRIPT_DIR / ".auto_refill_state.json"
+LOCK_FILE = SCRIPT_DIR / ".auto_refill.lock"
+
+DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+DEFAULT_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+
+log = logging.getLogger("auto_refill")
+
+
+# ── process lock / state helpers ───────────────────────────────────────────
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            SYNCHRONIZE = 0x00100000
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def acquire_lock(owner: str = "auto_refill") -> bool:
+    """Single-instance lock. Returns True if acquired."""
+    now = time.time()
+    if LOCK_FILE.is_file():
+        try:
+            prev = load_json(LOCK_FILE)
+            prev_pid = int(prev.get("pid") or 0)
+            if prev_pid and prev_pid != os.getpid() and _pid_alive(prev_pid):
+                log.error(
+                    "已有实例在运行 pid=%s owner=%s started=%s → %s",
+                    prev_pid,
+                    prev.get("owner"),
+                    prev.get("started_at"),
+                    LOCK_FILE,
+                )
+                return False
+        except Exception:
+            pass
+    save_json(
+        LOCK_FILE,
+        {
+            "pid": os.getpid(),
+            "owner": owner,
+            "started_at": now,
+            "host": os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "",
+        },
+    )
+    return True
+
+
+def release_lock() -> None:
+    try:
+        if not LOCK_FILE.is_file():
+            return
+        prev = load_json(LOCK_FILE)
+        if int(prev.get("pid") or 0) in (0, os.getpid()):
+            LOCK_FILE.unlink(missing_ok=True)  # type: ignore[call-arg]
+    except TypeError:
+        # py<3.8 missing_ok fallback
+        try:
+            if LOCK_FILE.is_file():
+                LOCK_FILE.unlink()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def load_state() -> dict[str, Any]:
+    return load_json(STATE_FILE)
+
+
+def save_state(state: dict[str, Any]) -> None:
+    save_json(STATE_FILE, state)
+
+
+def get_cleanup_cursor() -> int:
+    st = load_state()
+    try:
+        return int(st.get("cleanup_cursor") or 0)
+    except Exception:
+        return 0
+
+
+def set_cleanup_cursor(cursor: int) -> None:
+    st = load_state()
+    st["cleanup_cursor"] = int(cursor)
+    st["cleanup_cursor_updated_at"] = time.time()
+    save_state(st)
+
+
+def get_fail_streaks() -> dict[str, int]:
+    st = load_state()
+    raw = st.get("fail_streaks") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = int(v)
+        except Exception:
+            continue
+    return out
+
+
+def set_fail_streaks(streaks: dict[str, int]) -> None:
+    st = load_state()
+    # cap size
+    items = sorted(streaks.items(), key=lambda kv: kv[1], reverse=True)[:2000]
+    st["fail_streaks"] = {k: int(v) for k, v in items if int(v) > 0}
+    save_state(st)
+
+
+# ── util ───────────────────────────────────────────────────────────────────
+
+def _first_non_empty(*values: Any) -> Any:
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
+
+
+def _to_unix_seconds(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+        if n > 1e12:  # ms
+            n /= 1000.0
+        return int(n)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        n = float(s)
+        if n > 1e12:
+            n /= 1000.0
+        return int(n)
+    except ValueError:
+        pass
+    try:
+        # ISO-8601
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _to_rfc3339(unix_sec: int | float | None) -> str | None:
+    if unix_sec is None:
+        return None
+    return datetime.fromtimestamp(float(unix_sec), tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+
+
+def _b64url_decode(data: str) -> bytes:
+    pad = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + pad)
+
+
+def _parse_jwt_payload(token: str | None) -> dict[str, Any] | None:
+    if not token or not isinstance(token, str) or token.count(".") < 2:
+        return None
+    try:
+        payload = _b64url_decode(token.split(".")[1])
+        data = json.loads(payload.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _strip_empty(obj: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in obj.items() if v is not None and v != ""}
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def save_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+# ── config ─────────────────────────────────────────────────────────────────
+
+def default_config() -> dict[str, Any]:
+    return {
+        # 本地 grok2api（账号源 + 注册）
+        "source": {
+            "base_url": "http://127.0.0.1:3000",
+            "admin_password": "",  # 或用 admin_token
+            "admin_token": "",
+            # 导出筛选：active = 轮询中；空字符串 = 不过滤状态
+            "status": "active",
+            # 只要 last_probe.ok == true 的账号（验活通过）
+            "require_probe_ok": True,
+            # 本地分组名过滤（空 = 不限）
+            "group": "",
+            "export_batch_size": 50,
+            # 导出并成功绑定远程分组后，是否从本地删除（防丢号：绑失败不删）
+            "delete_after_export": True,
+            # 仅在绑定成功（或明确跳过绑定）后才删本地
+            "delete_only_after_bind": True,
+            # 本地号池最少保留多少 active 才够导出；不足则注册
+            "min_local_active": 50,
+            # 额外缓冲：exportable 目标 = max(need, min_local) + buffer
+            "local_buffer": 20,
+            # 自动注册
+            "auto_register": True,
+            "register_count": 40,  # 每次注册数量（local Turnstile 建议 ≤50）
+            "register_concurrency": 2,  # 本地 camoufox 建议 1~3
+            "register_stagger_ms": 800,
+            "register_probe_delay_sec": 30,
+            # 空 body 会用后台已保存的 registration_config（邮件/打码/代理）
+            "register_body": {},
+            "register_poll_interval_sec": 15,
+            "register_timeout_sec": 3600,
+            # 注册完成后等待秒数再导出（给 probe 时间）
+            "register_settle_sec": 45,
+            # 注册前检查本地是否过载；过载则跳过本轮注册
+            "register_health_gate": True,
+            "register_max_active_sessions": 8,
+            "register_max_cpu_skip": False,  # 需要 docker stats 时再开
+        },
+        # 远程 sub2api（号池目标）
+        "target": {
+            "base_url": "https://fd.diamondruby.xyz",
+            # 推荐 JWT：登录后 localStorage access_token，或接口返回
+            "access_token": "",
+            "email": "",
+            "password": "",
+            # 分组：优先 group_id；也可填 group_name 自动解析
+            "group_id": None,
+            "group_name": "grok",
+            "platform": "grok",
+            # 导入后是否 bulk-update 绑定 group_ids
+            "bind_group_after_import": True,
+            # 跳过默认分组绑定（导入到指定分组时建议 true）
+            "skip_default_group_bind": True,
+            # 每轮是否先测活并删除非 200
+            "cleanup_bad": True,
+            # 只检测 active 状态；false = 检测分组内全部
+            "cleanup_active_only": True,
+            # 单轮最多测活数量（0=不限；建议 40~80，全量测活很慢）
+            "cleanup_max": 60,
+            # 测活并发（线程）
+            "cleanup_workers": 6,
+            # 两次测活间隔秒（防压垮上游）
+            "cleanup_delay_sec": 0.05,
+            # 测活超时秒
+            "cleanup_timeout_sec": 45,
+            # 失败达到 streak 后才删
+            "cleanup_fail_delete": True,
+            # 同一账号连续失败几轮才删除（1=立刻删）
+            "cleanup_fail_streak": 2,
+            # 游标改存 .auto_refill_state.json（此处仅兼容读旧配置）
+            "cleanup_cursor": 0,
+            # 优先测这些状态（空=只按 active/全部分页）
+            "cleanup_prefer_status": ["error", "inactive", "expired", "quota_exhausted"],
+            # 主池按页拉取，避免每轮 list 全量
+            "cleanup_page_size": 100,
+        },
+        # 补号策略
+        "policy": {
+            "min_count": 300,  # 低于此值触发补号（紧急）
+            "target_count": 500,  # 补到此值
+            "max_per_cycle": 50,  # 单次最多导入
+            # 分层：current 在 [min, target) 时用较小批量
+            "normal_batch": 25,
+            "interval_sec": 180,  # 轮询间隔
+            "import_chunk_size": 25,  # 导入分片大小
+            "concurrency": 1,
+            "priority": 1,
+            "rate_multiplier": 1.0,
+            "dry_run": False,
+            # 阶段开关
+            "enable_cleanup": True,
+            "enable_register": True,
+            "enable_refill": True,
+            # 注册不等待整批完成（只触发；下轮再导出）
+            "register_async": False,
+        },
+        "logging": {
+            "level": "INFO",
+            "file": str(SCRIPT_DIR / "auto_refill.log"),
+        },
+    }
+
+
+def merge_dict(base: dict, overlay: dict) -> dict:
+    out = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path: Path | None, cli: argparse.Namespace | None = None) -> dict[str, Any]:
+    cfg = default_config()
+    conf_path = path or DEFAULT_CONFIG
+    if conf_path.is_file():
+        cfg = merge_dict(cfg, load_json(conf_path))
+        log.debug("loaded config %s", conf_path)
+    # env overrides
+    env_map = {
+        "SOURCE_BASE_URL": ("source", "base_url"),
+        "SOURCE_ADMIN_PASSWORD": ("source", "admin_password"),
+        "SOURCE_ADMIN_TOKEN": ("source", "admin_token"),
+        "TARGET_BASE_URL": ("target", "base_url"),
+        "TARGET_ACCESS_TOKEN": ("target", "access_token"),
+        "TARGET_EMAIL": ("target", "email"),
+        "TARGET_PASSWORD": ("target", "password"),
+        "TARGET_GROUP_NAME": ("target", "group_name"),
+        "TARGET_GROUP_ID": ("target", "group_id"),
+        "MIN_COUNT": ("policy", "min_count"),
+        "TARGET_COUNT": ("policy", "target_count"),
+        "INTERVAL_SEC": ("policy", "interval_sec"),
+    }
+    for env_key, path_keys in env_map.items():
+        val = os.environ.get(env_key)
+        if val is None or val == "":
+            continue
+        section, key = path_keys
+        if key in ("group_id", "min_count", "target_count", "interval_sec"):
+            try:
+                cfg[section][key] = int(val)
+            except ValueError:
+                cfg[section][key] = val
+        else:
+            cfg[section][key] = val
+    if cli:
+        if getattr(cli, "min_count", None) is not None:
+            cfg["policy"]["min_count"] = cli.min_count
+        if getattr(cli, "target_count", None) is not None:
+            cfg["policy"]["target_count"] = cli.target_count
+        if getattr(cli, "interval", None) is not None:
+            cfg["policy"]["interval_sec"] = cli.interval
+        if getattr(cli, "dry_run", False):
+            cfg["policy"]["dry_run"] = True
+        if getattr(cli, "once", False):
+            cfg["_once"] = True
+        if getattr(cli, "group_name", None):
+            cfg["target"]["group_name"] = cli.group_name
+        if getattr(cli, "group_id", None) is not None:
+            cfg["target"]["group_id"] = cli.group_id
+        if getattr(cli, "max_per_cycle", None) is not None:
+            cfg["policy"]["max_per_cycle"] = cli.max_per_cycle
+        if getattr(cli, "skip_cleanup", False):
+            cfg["policy"]["enable_cleanup"] = False
+        if getattr(cli, "skip_register", False):
+            cfg["policy"]["enable_register"] = False
+        if getattr(cli, "cleanup_only", False):
+            cfg["policy"]["enable_cleanup"] = True
+            cfg["policy"]["enable_register"] = False
+            cfg["policy"]["enable_refill"] = False
+        if getattr(cli, "register_only", False):
+            cfg["policy"]["enable_cleanup"] = False
+            cfg["policy"]["enable_register"] = True
+            cfg["policy"]["enable_refill"] = False
+    return cfg
+
+
+# ── convert (port of localhost:6501 logic) ─────────────────────────────────
+
+def convert_auth_record(
+    record: dict[str, Any],
+    *,
+    concurrency: int = 1,
+    priority: int = 1,
+    rate_multiplier: float = 1.0,
+) -> dict[str, Any]:
+    access_token = _first_non_empty(
+        record.get("key"),
+        record.get("access_token"),
+        record.get("accessToken"),
+        record.get("token"),
+        (record.get("credentials") or {}).get("access_token")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+    )
+    refresh_token = _first_non_empty(
+        record.get("refresh_token"),
+        record.get("refreshToken"),
+        record.get("rt"),
+        (record.get("credentials") or {}).get("refresh_token")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+    )
+    if not access_token and not refresh_token:
+        raise ValueError("缺少 access_token / key 或 refresh_token")
+
+    payload = _parse_jwt_payload(str(access_token) if access_token else None)
+    expires_at_unix = _first_non_empty(
+        _to_unix_seconds(record.get("expires_at")),
+        _to_unix_seconds(record.get("expiresAt")),
+        _to_unix_seconds(record.get("expired")),
+        _to_unix_seconds(
+            (record.get("credentials") or {}).get("expires_at")
+            if isinstance(record.get("credentials"), dict)
+            else None
+        ),
+        _to_unix_seconds(payload.get("exp")) if payload else None,
+    )
+    email = _first_non_empty(
+        record.get("email"),
+        (record.get("credentials") or {}).get("email")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+        payload.get("email") if payload else None,
+        record.get("name"),
+    )
+    sub = _first_non_empty(
+        record.get("user_id"),
+        record.get("userId"),
+        record.get("principal_id"),
+        record.get("sub"),
+        (record.get("credentials") or {}).get("sub")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+        payload.get("sub") if payload else None,
+        payload.get("principal_id") if payload else None,
+    )
+    team_id = _first_non_empty(
+        record.get("team_id"),
+        record.get("teamId"),
+        (record.get("credentials") or {}).get("team_id")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+        payload.get("team_id") if payload else None,
+    )
+    client_id = _first_non_empty(
+        record.get("oidc_client_id"),
+        record.get("client_id"),
+        record.get("clientId"),
+        (record.get("credentials") or {}).get("client_id")
+        if isinstance(record.get("credentials"), dict)
+        else None,
+        payload.get("client_id") if payload else None,
+        payload.get("aud") if payload else None,
+        DEFAULT_CLIENT_ID,
+    )
+    name = _first_non_empty(record.get("name"), email, sub, "Grok OAuth Account")
+
+    credentials = _strip_empty(
+        {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": _to_rfc3339(expires_at_unix) if expires_at_unix is not None else None,
+            "token_type": _first_non_empty(record.get("token_type"), "Bearer"),
+            "client_id": client_id,
+            "scope": _first_non_empty(record.get("scope"), DEFAULT_SCOPE),
+            "email": email,
+            "sub": sub,
+            "team_id": team_id,
+            "base_url": _first_non_empty(record.get("base_url"), DEFAULT_BASE_URL),
+            "id_token": _first_non_empty(record.get("id_token"), record.get("idToken")),
+        }
+    )
+    account = _strip_empty(
+        {
+            "name": name,
+            "notes": _first_non_empty(record.get("notes"), record.get("note")),
+            "platform": "grok",
+            "type": "oauth",
+            "credentials": credentials,
+            "extra": _strip_empty(
+                {
+                    "email": email,
+                    "source": "grok2api-auth-auto-refill",
+                    "user_id": sub,
+                    "team_id": team_id,
+                    "oidc_issuer": _first_non_empty(
+                        record.get("oidc_issuer"), "https://auth.x.ai"
+                    ),
+                    "create_time": record.get("create_time"),
+                    "auth_mode": _first_non_empty(record.get("auth_mode"), "oidc"),
+                }
+            ),
+            "concurrency": concurrency,
+            "priority": priority,
+            "rate_multiplier": rate_multiplier,
+            "expires_at": expires_at_unix,
+            "auto_pause_on_expired": True,
+        }
+    )
+    return account
+
+
+def convert_export_to_sub2(
+    export_payload: dict[str, Any],
+    *,
+    concurrency: int = 1,
+    priority: int = 1,
+    rate_multiplier: float = 1.0,
+) -> dict[str, Any]:
+    auth = export_payload.get("auth")
+    if not isinstance(auth, dict):
+        raise ValueError("export payload missing auth map")
+    accounts: list[dict[str, Any]] = []
+    issues: list[str] = []
+    seen_emails: set[str] = set()
+    for key, rec in auth.items():
+        if not isinstance(rec, dict):
+            issues.append(f"{key}: not an object")
+            continue
+        try:
+            acc = convert_auth_record(
+                rec,
+                concurrency=concurrency,
+                priority=priority,
+                rate_multiplier=rate_multiplier,
+            )
+        except Exception as e:  # noqa: BLE001
+            issues.append(f"{key}: {e}")
+            continue
+        email_key = str(acc.get("name") or "").lower()
+        if email_key and email_key in seen_emails:
+            issues.append(f"{key}: duplicate name/email skipped")
+            continue
+        if email_key:
+            seen_emails.add(email_key)
+        accounts.append(acc)
+    return {
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "proxies": [],
+        "accounts": accounts,
+        "_meta": {"count": len(accounts), "issues": issues},
+    }
+
+
+# ── HTTP clients ───────────────────────────────────────────────────────────
+
+class SourceClient:
+    """Local grok2api admin client."""
+
+    def __init__(self, cfg: dict[str, Any], session: requests.Session | None = None):
+        self.cfg = cfg
+        self.base = cfg["base_url"].rstrip("/")
+        self.s = session or requests.Session()
+        self.token = (cfg.get("admin_token") or "").strip()
+
+    def _headers(self) -> dict[str, str]:
+        h = {"Accept": "application/json"}
+        if self.token:
+            h["X-Admin-Token"] = self.token
+        return h
+
+    def login(self) -> None:
+        if self.token:
+            # validate
+            r = self.s.get(
+                f"{self.base}/admin/api/session",
+                headers=self._headers(),
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return
+            log.warning("source token invalid, try password login")
+            self.token = ""
+        password = self.cfg.get("admin_password") or ""
+        if not password:
+            raise RuntimeError(
+                "source.admin_password 或 source.admin_token 必须配置其一"
+            )
+        r = self.s.post(
+            f"{self.base}/admin/api/login",
+            json={"password": password},
+            timeout=30,
+        )
+        if r.status_code == 401:
+            raise RuntimeError(
+                "本地管理密码错误 (401)。请在控制面板「配置」里重新填写 "
+                "source.admin_password（与 http://127.0.0.1:3000/admin/login 相同）"
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"本地登录失败 HTTP {r.status_code}: {(r.text or '')[:300]}"
+            )
+        data = r.json()
+        token = data.get("token")
+        if not token:
+            raise RuntimeError(f"source login failed: {data}")
+        self.token = str(token)
+        log.info("source login ok")
+
+    def list_accounts(
+        self,
+        *,
+        status: str = "active",
+        group: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "page": page,
+            "page_size": page_size,
+            "sort": "newest",
+        }
+        if status:
+            params["status"] = status
+        if group:
+            params["group"] = group
+        r = self.s.get(
+            f"{self.base}/admin/api/accounts",
+            params=params,
+            headers=self._headers(),
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def collect_export_ids(
+        self,
+        *,
+        need: int,
+        status: str,
+        group: str,
+        require_probe_ok: bool,
+        page_size: int = 100,
+        max_pages: int = 50,
+    ) -> list[str]:
+        ids: list[str] = []
+        page = 1
+        while len(ids) < need and page <= max_pages:
+            data = self.list_accounts(
+                status=status, group=group, page=page, page_size=page_size
+            )
+            rows = data.get("accounts") or data.get("items") or []
+            if not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                acc_id = str(row.get("id") or "").strip()
+                if not acc_id:
+                    continue
+                if require_probe_ok:
+                    pool = row.get("_pool") or row.get("pool") or {}
+                    probe = pool.get("last_probe") if isinstance(pool, dict) else None
+                    if not isinstance(probe, dict) or not probe.get("ok"):
+                        continue
+                    if pool.get("enabled") is False:
+                        continue
+                ids.append(acc_id)
+                if len(ids) >= need:
+                    break
+            total_pages = int(data.get("total_pages") or 1)
+            if page >= total_pages:
+                break
+            page += 1
+        return ids
+
+    def export_by_ids(self, ids: list[str]) -> dict[str, Any]:
+        if not ids:
+            return {"ok": True, "auth": {}, "count": 0}
+        r = self.s.post(
+            f"{self.base}/admin/api/accounts/export-batch",
+            params={"download": 0, "async_job": 0},
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json={"ids": ids, "include_secrets": True},
+            timeout=180,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # sync path may wrap as {ok, auth, count} or just auth map
+        if isinstance(data, dict) and "auth" in data:
+            return data
+        if isinstance(data, dict) and any(
+            isinstance(v, dict) and ("key" in v or "access_token" in v or "refresh_token" in v)
+            for v in data.values()
+        ):
+            return {"ok": True, "auth": data, "count": len(data)}
+        raise RuntimeError(f"unexpected export response keys: {list(data)[:20]}")
+
+    def delete_accounts(self, ids: list[str]) -> dict[str, Any]:
+        if not ids:
+            return {"ok": True, "deleted": 0}
+        r = self.s.post(
+            f"{self.base}/admin/api/accounts/delete-batch",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json={"ids": ids},
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {"ok": True}
+
+    def count_exportable(self, limit: int = 500) -> int:
+        """Count local accounts that would pass export filters (capped for speed)."""
+        # 只扫到 limit 即可，避免每轮全表扫描拖慢闭环
+        ids = self.collect_export_ids(
+            need=max(1, int(limit)),
+            status=self.cfg.get("status") or "active",
+            group=self.cfg.get("group") or "",
+            require_probe_ok=bool(self.cfg.get("require_probe_ok", True)),
+            page_size=100,
+            max_pages=20,
+        )
+        return len(ids)
+
+    def start_registration(self, count: int | None = None) -> dict[str, Any]:
+        # Health gate: stop leftover sessions / refuse when too many active
+        if self.cfg.get("register_health_gate", True):
+            try:
+                gate = self.ensure_register_capacity()
+                if not gate.get("ok"):
+                    raise RuntimeError(gate.get("message") or "register health gate blocked")
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("register health gate skipped: %s", e)
+        body = dict(self.cfg.get("register_body") or {})
+        n = int(count if count is not None else (self.cfg.get("register_count") or 40))
+        body.setdefault("count", n)
+        # local solver is single-browser-ish — keep concurrency low
+        body.setdefault(
+            "concurrency",
+            min(3, int(self.cfg.get("register_concurrency") or 2)),
+        )
+        body.setdefault(
+            "stagger_ms", int(self.cfg.get("register_stagger_ms") or 800)
+        )
+        body.setdefault(
+            "probe_delay_sec",
+            int(self.cfg.get("register_probe_delay_sec") or 30),
+        )
+        r = self.s.post(
+            f"{self.base}/admin/api/accounts/register-email",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json=body,
+            timeout=120,
+        )
+        if r.status_code >= 400:
+            log.error("register start failed %s: %s", r.status_code, r.text[:600])
+        r.raise_for_status()
+        return r.json()
+
+    def get_registration_sessions(self, *, limit: int = 60, active_only: bool = False) -> dict[str, Any]:
+        r = self.s.get(
+            f"{self.base}/admin/api/accounts/register-email/sessions",
+            params={"limit": limit, "active_only": 1 if active_only else 0},
+            headers=self._headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def stop_all_registrations(self) -> dict[str, Any]:
+        r = self.s.post(
+            f"{self.base}/admin/api/accounts/register-email/stop",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json={},
+            timeout=60,
+        )
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+        return r.json() if r.content else {"ok": True}
+
+    def ensure_register_capacity(self) -> dict[str, Any]:
+        """If too many active reg sessions, stop leftovers; block if still overloaded."""
+        terminal = {
+            "imported",
+            "error",
+            "done",
+            "finished",
+            "completed",
+            "cancelled",
+            "stopped",
+            "success",
+            "failed",
+        }
+        data = self.get_registration_sessions(limit=120, active_only=False)
+        sessions = data.get("sessions") or []
+        active = [
+            s
+            for s in sessions
+            if str(s.get("status") or "").lower() not in terminal
+        ]
+        max_active = int(self.cfg.get("register_max_active_sessions") or 8)
+        stuck = []
+        now = time.time()
+        for s in active:
+            age = now - float(s.get("updated_at") or s.get("created_at") or now)
+            st = str(s.get("status") or "").lower()
+            # long-lived solving/stopping is almost always dead weight
+            if age > 600 or st in {"stopping", "solving_turnstile"} and age > 300:
+                stuck.append(s)
+
+        if stuck or len(active) > max_active:
+            log.warning(
+                "本地注册过载/卡住: active=%s stuck=%s → 请求 stop-all",
+                len(active),
+                len(stuck),
+            )
+            stop_res = self.stop_all_registrations()
+            time.sleep(2)
+            data2 = self.get_registration_sessions(limit=80, active_only=True)
+            active2 = data2.get("sessions") or []
+            # API may ignore active_only on old builds
+            active2 = [
+                s
+                for s in (data2.get("sessions") or sessions)
+                if str(s.get("status") or "").lower() not in terminal
+            ]
+            if len(active2) > max_active:
+                return {
+                    "ok": False,
+                    "message": (
+                        f"本地注册仍过载 active={len(active2)}>{max_active}，"
+                        f"已 stop-all={stop_res.get('ok')}；跳过本轮注册以免卡死后台"
+                    ),
+                    "active": len(active2),
+                    "stop": stop_res,
+                }
+            return {
+                "ok": True,
+                "message": f"已清理注册会话，active≈{len(active2)}",
+                "active": len(active2),
+                "stop": stop_res,
+            }
+        return {"ok": True, "active": len(active), "message": "register capacity ok"}
+
+    def get_registration_batch(self, batch_id: str) -> dict[str, Any]:
+        r = self.s.get(
+            f"{self.base}/admin/api/accounts/register-email/batches/{batch_id}",
+            headers=self._headers(),
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def wait_registration(
+        self,
+        batch_id: str,
+        *,
+        timeout_sec: int = 3600,
+        poll_sec: int = 15,
+    ) -> dict[str, Any]:
+        terminal = {
+            "done",
+            "finished",
+            "completed",
+            "success",
+            "error",
+            "failed",
+            "cancelled",
+            "stopped",
+        }
+        started = time.time()
+        last: dict[str, Any] = {}
+        while time.time() - started < timeout_sec:
+            try:
+                last = self.get_registration_batch(batch_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("poll batch %s: %s", batch_id, e)
+                time.sleep(poll_sec)
+                continue
+            st = str(last.get("status") or "").lower()
+            finished = int(last.get("finished") or 0)
+            count = int(last.get("count") or 0)
+            ok_c = int(last.get("ok_count") or 0)
+            fail_c = int(last.get("fail_count") or 0)
+            log.info(
+                "注册批次 %s status=%s finished=%s/%s ok=%s fail=%s",
+                batch_id,
+                st,
+                finished,
+                count,
+                ok_c,
+                fail_c,
+            )
+            if st in terminal or (count > 0 and finished >= count and st not in ("running", "starting", "queued", "spawning")):
+                return last
+            # also treat runner_alive=false + finished>=count
+            if last.get("runner_alive") is False and count and finished >= count:
+                return last
+            time.sleep(max(3, poll_sec))
+        last["timeout"] = True
+        return last
+
+    def ensure_local_pool(self, need_export: int) -> dict[str, Any]:
+        """If exportable accounts < need, start registration batch and wait."""
+        out: dict[str, Any] = {
+            "exportable_before": 0,
+            "registered": False,
+            "batch_id": None,
+            "batch": None,
+        }
+        if not self.cfg.get("auto_register", True):
+            out["skipped"] = "auto_register=false"
+            return out
+        # 只数到 need+缓冲，避免全表扫描
+        scan_limit = max(need_export + 20, int(self.cfg.get("min_local_active") or 30) + 10, 50)
+        exportable = self.count_exportable(limit=scan_limit)
+        out["exportable_before"] = exportable
+        min_local = int(self.cfg.get("min_local_active") or 0)
+        threshold = max(need_export, min_local)
+        if exportable >= threshold:
+            out["message"] = f"本地可导出 {exportable} >= {threshold}"
+            return out
+        reg_count = int(self.cfg.get("register_count") or 50)
+        # 只补缺口，不要 max(缺口, reg_count) 造成一次注册过多
+        deficit = max(1, threshold - exportable)
+        reg_n = min(max(reg_count, deficit), max(reg_count * 2, deficit))
+        # 硬上限，防止配置失误一次注册上千
+        reg_n = min(reg_n, 200)
+        log.info(
+            "本地可导出不足 (%s < %s)，启动注册 ×%s",
+            exportable,
+            threshold,
+            reg_n,
+        )
+        started = self.start_registration(reg_n)
+        batch_id = started.get("batch_id") or (started.get("batch") or {}).get("id")
+        out["registered"] = True
+        out["batch_id"] = batch_id
+        out["register_count"] = reg_n
+        out["start"] = {
+            k: started.get(k)
+            for k in ("ok", "count", "concurrency", "message", "batch_id")
+        }
+        if not batch_id:
+            # single-session fallback
+            sid = started.get("id") or started.get("session_id")
+            out["session_id"] = sid
+            log.warning("未返回 batch_id，session=%s raw_keys=%s", sid, list(started)[:20])
+            settle = int(self.cfg.get("register_settle_sec") or 45)
+            time.sleep(settle)
+            return out
+        batch = self.wait_registration(
+            str(batch_id),
+            timeout_sec=int(self.cfg.get("register_timeout_sec") or 3600),
+            poll_sec=int(self.cfg.get("register_poll_interval_sec") or 15),
+        )
+        out["batch"] = {
+            "status": batch.get("status"),
+            "finished": batch.get("finished"),
+            "ok_count": batch.get("ok_count"),
+            "fail_count": batch.get("fail_count"),
+            "timeout": batch.get("timeout"),
+        }
+        settle = int(self.cfg.get("register_settle_sec") or 45)
+        log.info("注册结束，等待 settle %ss 以便 probe 完成…", settle)
+        time.sleep(max(0, settle))
+        out["exportable_after"] = self.count_exportable(limit=scan_limit)
+        return out
+
+
+class TargetClient:
+    """Remote sub2api admin client."""
+
+    def __init__(self, cfg: dict[str, Any], session: requests.Session | None = None):
+        self.cfg = cfg
+        self.base = cfg["base_url"].rstrip("/")
+        self.api = f"{self.base}/api/v1"
+        self.s = session or requests.Session()
+        self.token = (cfg.get("access_token") or "").strip()
+
+    def _headers(self) -> dict[str, str]:
+        h = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        return h
+
+    def login(self) -> None:
+        if self.token:
+            r = self.s.get(
+                f"{self.api}/auth/me",
+                headers=self._headers(),
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return
+            # some deployments use /user
+            r2 = self.s.get(f"{self.api}/user", headers=self._headers(), timeout=30)
+            if r2.status_code == 200:
+                return
+            log.warning("target token invalid (%s), try password login", r.status_code)
+            self.token = ""
+        email = self.cfg.get("email") or ""
+        password = self.cfg.get("password") or ""
+        if not email or not password:
+            raise RuntimeError(
+                "target.access_token 或 (target.email + target.password) 必须配置"
+            )
+        r = self.s.post(
+            f"{self.api}/auth/login",
+            json={"email": email, "password": password},
+            timeout=30,
+        )
+        if r.status_code == 401:
+            raise RuntimeError(
+                "远程管理员账号/密码错误 (401)。请检查 target.email / target.password，"
+                "或改用登录后浏览器 localStorage 的 access_token 填到 target.access_token"
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"远程登录失败 HTTP {r.status_code}: {(r.text or '')[:300]}"
+            )
+        data = r.json()
+        # unwrap {code, data} style
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+            data = data["data"]
+        token = data.get("access_token") or data.get("token")
+        if not token:
+            raise RuntimeError(f"target login failed: {data}")
+        self.token = str(token)
+        log.info("target login ok")
+
+    def _unwrap(self, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and "data" in data
+            and data.get("code") in (0, None, "0", 200)
+        ):
+            return data["data"]
+        return data
+
+    def resolve_group_id(self) -> int | None:
+        gid = self.cfg.get("group_id")
+        if gid is not None and str(gid).strip() != "":
+            return int(gid)
+        name = (self.cfg.get("group_name") or "").strip()
+        if not name:
+            return None
+        platform = self.cfg.get("platform") or "grok"
+        r = self.s.get(
+            f"{self.api}/admin/groups/all",
+            params={"platform": platform},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code == 404:
+            r = self.s.get(
+                f"{self.api}/admin/groups/all",
+                headers=self._headers(),
+                timeout=30,
+            )
+        r.raise_for_status()
+        data = self._unwrap(r.json())
+        groups = data if isinstance(data, list) else (data.get("items") or data.get("groups") or [])
+        name_l = name.lower()
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gname = str(g.get("name") or g.get("group_name") or "").strip()
+            if gname.lower() == name_l or gname == name:
+                return int(g.get("id"))
+        # partial match
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gname = str(g.get("name") or g.get("group_name") or "").strip()
+            if name_l in gname.lower():
+                log.info("group partial match: %s (id=%s)", gname, g.get("id"))
+                return int(g.get("id"))
+        raise RuntimeError(
+            f"找不到分组 name={name!r} platform={platform}. "
+            f"可用: {[ (x.get('id'), x.get('name')) for x in groups[:30] if isinstance(x, dict) ]}"
+        )
+
+    def count_group_accounts(self, group_id: int | None) -> int:
+        """Count accounts in group (prefer status=active if supported)."""
+        params: dict[str, Any] = {
+            "page": 1,
+            "page_size": 1,
+            "platform": self.cfg.get("platform") or "grok",
+        }
+        if group_id is not None:
+            params["group"] = str(group_id)
+        # try active only first
+        for status in ("active", ""):
+            p = dict(params)
+            if status:
+                p["status"] = status
+            r = self.s.get(
+                f"{self.api}/admin/accounts",
+                params=p,
+                headers=self._headers(),
+                timeout=60,
+            )
+            if r.status_code == 400 and status:
+                continue
+            r.raise_for_status()
+            data = self._unwrap(r.json())
+            if not isinstance(data, dict):
+                continue
+            for key in ("total", "total_count", "count"):
+                if data.get(key) is not None:
+                    return int(data[key])
+            # pagination wrappers
+            pag = data.get("pagination") or data.get("meta") or {}
+            if isinstance(pag, dict) and pag.get("total") is not None:
+                return int(pag["total"])
+        raise RuntimeError("无法解析远程账号总数")
+
+    def import_data(
+        self,
+        sub2_doc: dict[str, Any],
+        *,
+        skip_default_group_bind: bool = True,
+    ) -> dict[str, Any]:
+        # strip internal meta
+        payload = {
+            "exported_at": sub2_doc.get("exported_at"),
+            "proxies": sub2_doc.get("proxies") or [],
+            "accounts": sub2_doc.get("accounts") or [],
+        }
+        body = {
+            "data": payload,
+            "skip_default_group_bind": skip_default_group_bind,
+        }
+        r = self.s.post(
+            f"{self.api}/admin/accounts/data",
+            headers=self._headers(),
+            json=body,
+            timeout=300,
+        )
+        if r.status_code >= 400:
+            log.error("import failed %s: %s", r.status_code, r.text[:800])
+        r.raise_for_status()
+        return self._unwrap(r.json()) if r.content else {}
+
+    def bulk_bind_group(
+        self,
+        account_ids: list[int],
+        group_id: int,
+    ) -> dict[str, Any]:
+        if not account_ids:
+            return {"success": 0}
+        body = {
+            "account_ids": account_ids,
+            "group_ids": [group_id],
+        }
+        r = self.s.post(
+            f"{self.api}/admin/accounts/bulk-update",
+            headers=self._headers(),
+            json=body,
+            timeout=180,
+        )
+        if r.status_code >= 400:
+            # try alternate shape
+            r2 = self.s.post(
+                f"{self.api}/admin/accounts/bulk-update",
+                headers=self._headers(),
+                json={"account_ids": account_ids, "updates": {"group_ids": [group_id]}},
+                timeout=180,
+            )
+            if r2.status_code < 400:
+                return self._unwrap(r2.json()) if r2.content else {}
+            log.error("bulk bind failed: %s %s", r.status_code, r.text[:500])
+            r.raise_for_status()
+        return self._unwrap(r.json()) if r.content else {}
+
+    def list_group_accounts(
+        self,
+        group_id: int | None,
+        *,
+        status: str = "active",
+        page_size: int = 100,
+        max_pages: int = 200,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page = 1
+        while page <= max_pages:
+            params: dict[str, Any] = {
+                "page": page,
+                "page_size": page_size,
+                "platform": self.cfg.get("platform") or "grok",
+            }
+            if group_id is not None:
+                params["group"] = str(group_id)
+            if status:
+                params["status"] = status
+            r = self.s.get(
+                f"{self.api}/admin/accounts",
+                params=params,
+                headers=self._headers(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = self._unwrap(r.json())
+            rows: list[Any] = []
+            total = None
+            total_pages = None
+            if isinstance(data, dict):
+                rows = (
+                    data.get("items")
+                    or data.get("accounts")
+                    or data.get("data")
+                    or []
+                )
+                total = data.get("total") or data.get("total_count")
+                total_pages = data.get("total_pages") or data.get("pages")
+                pag = data.get("pagination") or data.get("meta") or {}
+                if isinstance(pag, dict):
+                    total = total or pag.get("total")
+                    total_pages = total_pages or pag.get("total_pages") or pag.get("pages")
+            elif isinstance(data, list):
+                rows = data
+            if not rows:
+                break
+            for row in rows:
+                if isinstance(row, dict):
+                    items.append(row)
+            if total_pages and page >= int(total_pages):
+                break
+            if total is not None and len(items) >= int(total):
+                break
+            if len(rows) < page_size:
+                break
+            page += 1
+        return items
+
+    def test_account(self, account_id: int) -> dict[str, Any]:
+        r = self.s.post(
+            f"{self.api}/admin/accounts/{account_id}/test",
+            headers=self._headers(),
+            timeout=90,
+        )
+        http_status = r.status_code
+        body: Any
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:500]}
+        data = self._unwrap(body) if isinstance(body, dict) else body
+        success = None
+        message = ""
+        if isinstance(data, dict):
+            if "success" in data:
+                success = bool(data.get("success"))
+            elif "ok" in data:
+                success = bool(data.get("ok"))
+            message = str(data.get("message") or data.get("error") or "")
+        # 你要求的：状态码不是 200 → 判失败
+        ok = http_status == 200 and (success is not False)
+        if success is False:
+            ok = False
+        return {
+            "ok": ok,
+            "http_status": http_status,
+            "success": success,
+            "message": message,
+            "raw": data if isinstance(data, dict) else {"value": data},
+        }
+
+    def delete_account(self, account_id: int) -> dict[str, Any]:
+        r = self.s.delete(
+            f"{self.api}/admin/accounts/{account_id}",
+            headers=self._headers(),
+            timeout=60,
+        )
+        try:
+            body = r.json() if r.content else {}
+        except Exception:
+            body = {"raw": r.text[:300]}
+        return {
+            "http_status": r.status_code,
+            "ok": r.status_code in (200, 204),
+            "body": self._unwrap(body) if isinstance(body, dict) else body,
+        }
+
+    def _pick_cleanup_batch(
+        self,
+        group_id: int | None,
+        *,
+        max_n: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Pick a batch via prefer-status + page-based cursor (no full-pool list)."""
+        meta: dict[str, Any] = {"mode": "paged", "cursor": 0, "pool_size": None}
+        prefer = list(self.cfg.get("cleanup_prefer_status") or [])
+        selected: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        page_size = max(20, min(100, int(self.cfg.get("cleanup_page_size") or 100)))
+
+        def _add(rows: list[dict[str, Any]]) -> None:
+            for row in rows:
+                if not isinstance(row, dict) or row.get("id") is None:
+                    continue
+                aid = int(row["id"])
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                selected.append(row)
+
+        # 1) prefer bad statuses first (up to half batch)
+        prefer_budget = max(1, max_n // 2) if prefer else 0
+        for st in prefer:
+            if len(selected) >= prefer_budget:
+                break
+            try:
+                rows = self.list_group_accounts(
+                    group_id,
+                    status=str(st),
+                    page_size=min(page_size, prefer_budget),
+                    max_pages=1,
+                )
+                _add(rows)
+            except Exception as e:  # noqa: BLE001
+                log.debug("prefer status %s skipped: %s", st, e)
+
+        # 2) page-based cursor on active/all pool
+        status = "active" if self.cfg.get("cleanup_active_only", True) else ""
+        cursor = int(self.cfg.get("cleanup_cursor") or get_cleanup_cursor() or 0)
+        if cursor < 0:
+            cursor = 0
+        page = cursor // page_size + 1
+        need = max(0, max_n - len(selected))
+        pages_to_fetch = max(1, (need + page_size - 1) // page_size)
+
+        # probe total via first page
+        first = self.list_group_accounts(
+            group_id, status=status, page_size=page_size, max_pages=1
+        )
+        # re-fetch desired page window
+        pool_chunk: list[dict[str, Any]] = []
+        # If cursor page beyond end, wrap
+        # We don't always know total; use empty page as wrap signal
+        for i in range(pages_to_fetch + 1):  # +1 for wrap retry
+            p = page + i
+            rows = self.list_group_accounts(
+                group_id, status=status, page_size=page_size, max_pages=1
+            )
+            # list_group_accounts always starts page=1; need a paged variant
+            rows = self._list_group_page(
+                group_id, status=status, page=p, page_size=page_size
+            )
+            if not rows:
+                # wrap to start
+                if p > 1:
+                    page = 1
+                    rows = self._list_group_page(
+                        group_id, status=status, page=1, page_size=page_size
+                    )
+                if not rows:
+                    break
+            pool_chunk.extend(rows)
+            if len(pool_chunk) >= need:
+                break
+
+        # fallback: if paged helper unavailable, use first page only
+        if not pool_chunk and first:
+            pool_chunk = first
+
+        _add(pool_chunk[:need])
+        advanced = max(1, min(need, len(pool_chunk) or 1))
+        # approximate next cursor as offset in stream
+        next_cursor = cursor + advanced
+        # soft wrap every ~50 pages to avoid unbounded growth
+        if next_cursor > page_size * 50:
+            next_cursor = 0
+        meta["cursor"] = cursor
+        meta["next_cursor"] = next_cursor
+        meta["page"] = page
+        meta["page_size"] = page_size
+        meta["batch_size"] = len(selected[:max_n] if max_n > 0 else selected)
+        self.cfg["cleanup_cursor"] = next_cursor
+        if max_n > 0 and len(selected) > max_n:
+            selected = selected[:max_n]
+        return selected, meta
+
+    def _list_group_page(
+        self,
+        group_id: int | None,
+        *,
+        status: str,
+        page: int,
+        page_size: int,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "page": max(1, int(page)),
+            "page_size": max(1, int(page_size)),
+            "platform": self.cfg.get("platform") or "grok",
+        }
+        if group_id is not None:
+            params["group"] = str(group_id)
+        if status:
+            params["status"] = status
+        r = self.s.get(
+            f"{self.api}/admin/accounts",
+            params=params,
+            headers=self._headers(),
+            timeout=60,
+        )
+        if r.status_code == 400 and status:
+            params.pop("status", None)
+            r = self.s.get(
+                f"{self.api}/admin/accounts",
+                params=params,
+                headers=self._headers(),
+                timeout=60,
+            )
+        r.raise_for_status()
+        data = self._unwrap(r.json())
+        if isinstance(data, dict):
+            rows = (
+                data.get("items")
+                or data.get("accounts")
+                or data.get("data")
+                or []
+            )
+            return [x for x in rows if isinstance(x, dict)]
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+
+    def cleanup_bad_accounts(
+        self,
+        group_id: int | None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Test a rotating batch; delete only after consecutive failures."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        max_n = int(self.cfg.get("cleanup_max") or 0)
+        if max_n <= 0:
+            max_n = 200
+            log.warning("cleanup_max<=0，已自动限制为 200/轮（避免全量测活）")
+
+        # seed cursor from state
+        self.cfg["cleanup_cursor"] = int(
+            self.cfg.get("cleanup_cursor") or get_cleanup_cursor() or 0
+        )
+        accounts, pick_meta = self._pick_cleanup_batch(group_id, max_n=max_n)
+        workers = max(1, min(16, int(self.cfg.get("cleanup_workers") or 6)))
+        delay = float(self.cfg.get("cleanup_delay_sec") or 0)
+        do_delete = bool(self.cfg.get("cleanup_fail_delete", True))
+        need_streak = max(1, int(self.cfg.get("cleanup_fail_streak") or 2))
+        timeout = float(self.cfg.get("cleanup_timeout_sec") or 45)
+        streaks = get_fail_streaks()
+
+        stats: dict[str, Any] = {
+            "total": len(accounts),
+            "pool_size": pick_meta.get("pool_size"),
+            "cursor": pick_meta.get("cursor"),
+            "next_cursor": pick_meta.get("next_cursor"),
+            "page": pick_meta.get("page"),
+            "tested": 0,
+            "ok": 0,
+            "bad": 0,
+            "deleted": 0,
+            "delete_failed": 0,
+            "errors": 0,
+            "soft_bad": 0,  # failed but not yet deleted (streak)
+            "bad_ids": [],
+            "dry_run": dry_run,
+            "fail_streak_need": need_streak,
+        }
+
+        log.info(
+            "远程清理: group_id=%s 本批=%s cursor=%s→%s page=%s workers=%s streak=%s dry_run=%s",
+            group_id,
+            len(accounts),
+            pick_meta.get("cursor"),
+            pick_meta.get("next_cursor"),
+            pick_meta.get("page"),
+            workers,
+            need_streak,
+            dry_run,
+        )
+        if not accounts:
+            if pick_meta.get("next_cursor") is not None:
+                set_cleanup_cursor(int(pick_meta["next_cursor"]))
+            return stats
+
+        def _work(acc: dict[str, Any]) -> dict[str, Any]:
+            aid = acc.get("id")
+            name = acc.get("name") or acc.get("email") or aid
+            if aid is None:
+                return {"skip": True}
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                r = self.s.post(
+                    f"{self.api}/admin/accounts/{int(aid)}/test",
+                    headers=self._headers(),
+                    timeout=timeout,
+                )
+                http_status = r.status_code
+                # transient server errors: do not count as account-bad
+                if http_status in (429, 500, 502, 503, 504):
+                    return {
+                        "id": int(aid),
+                        "name": name,
+                        "transient": True,
+                        "http_status": http_status,
+                    }
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {"raw": r.text[:500]}
+                data = self._unwrap(body) if isinstance(body, dict) else body
+                success = None
+                message = ""
+                if isinstance(data, dict):
+                    if "success" in data:
+                        success = bool(data.get("success"))
+                    elif "ok" in data:
+                        success = bool(data.get("ok"))
+                    message = str(data.get("message") or data.get("error") or "")
+                ok = http_status == 200 and success is not False
+                if success is False:
+                    ok = False
+                return {
+                    "id": int(aid),
+                    "name": name,
+                    "test": {
+                        "ok": ok,
+                        "http_status": http_status,
+                        "success": success,
+                        "message": message,
+                    },
+                }
+            except Exception as e:  # noqa: BLE001
+                # network/timeout → soft error, no streak
+                return {
+                    "id": int(aid) if aid is not None else None,
+                    "name": name,
+                    "error": str(e)[:300],
+                    "transient": True,
+                }
+
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cleanup") as ex:
+            futs = [ex.submit(_work, a) for a in accounts]
+            for fut in as_completed(futs):
+                results.append(fut.result())
+
+        for res in results:
+            if res.get("skip"):
+                continue
+            if res.get("transient") or res.get("error"):
+                stats["errors"] += 1
+                if res.get("error"):
+                    log.warning("测活异常 id=%s: %s", res.get("id"), res.get("error"))
+                continue
+            stats["tested"] += 1
+            test = res.get("test") or {}
+            aid = res.get("id")
+            key = str(aid)
+            if test.get("ok"):
+                stats["ok"] += 1
+                if key in streaks:
+                    streaks.pop(key, None)
+            else:
+                stats["bad"] += 1
+                streaks[key] = int(streaks.get(key) or 0) + 1
+                streak_n = streaks[key]
+                stats["bad_ids"].append(
+                    {
+                        "id": aid,
+                        "name": res.get("name"),
+                        "http_status": test.get("http_status"),
+                        "message": test.get("message"),
+                        "streak": streak_n,
+                    }
+                )
+                log.warning(
+                    "坏号 id=%s name=%s http=%s streak=%s/%s msg=%s",
+                    aid,
+                    res.get("name"),
+                    test.get("http_status"),
+                    streak_n,
+                    need_streak,
+                    (test.get("message") or "")[:120],
+                )
+                if do_delete and aid is not None and streak_n >= need_streak:
+                    if dry_run:
+                        stats["deleted"] += 1
+                        continue
+                    d = self.delete_account(int(aid))
+                    if d.get("ok"):
+                        stats["deleted"] += 1
+                        streaks.pop(key, None)
+                        log.info("已删除坏号 id=%s (streak=%s)", aid, streak_n)
+                    else:
+                        stats["delete_failed"] += 1
+                        log.error("删除失败 id=%s %s", aid, d)
+                else:
+                    stats["soft_bad"] += 1
+
+        if not dry_run:
+            set_fail_streaks(streaks)
+            if pick_meta.get("next_cursor") is not None:
+                set_cleanup_cursor(int(pick_meta["next_cursor"]))
+
+        log.info(
+            "远程清理完成: tested=%s ok=%s bad=%s soft_bad=%s deleted=%s errors=%s cursor→%s",
+            stats["tested"],
+            stats["ok"],
+            stats["bad"],
+            stats["soft_bad"],
+            stats["deleted"],
+            stats["errors"],
+            stats.get("next_cursor"),
+        )
+        return stats
+
+    def list_recent_account_ids(
+        self,
+        *,
+        group_id: int | None,
+        limit: int,
+        search_emails: list[str] | None = None,
+    ) -> list[int]:
+        """Best-effort: find newly imported account ids by email search."""
+        found: list[int] = []
+        if search_emails:
+            for email in search_emails:
+                r = self.s.get(
+                    f"{self.api}/admin/accounts",
+                    params={
+                        "page": 1,
+                        "page_size": 5,
+                        "platform": self.cfg.get("platform") or "grok",
+                        "search": email,
+                        **({"group": str(group_id)} if group_id is not None else {}),
+                    },
+                    headers=self._headers(),
+                    timeout=60,
+                )
+                if r.status_code >= 400:
+                    continue
+                data = self._unwrap(r.json())
+                items = []
+                if isinstance(data, dict):
+                    items = data.get("items") or data.get("accounts") or data.get("data") or []
+                for it in items:
+                    if isinstance(it, dict) and it.get("id") is not None:
+                        found.append(int(it["id"]))
+                if len(found) >= limit:
+                    break
+        return found
+
+
+# ── core cycle ─────────────────────────────────────────────────────────────
+
+def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -> dict[str, Any]:
+    policy = cfg["policy"]
+    src_cfg = cfg["source"]
+    tgt_cfg = cfg["target"]
+    dry = bool(policy.get("dry_run"))
+
+    group_id = target.resolve_group_id()
+    min_count = int(policy["min_count"])
+    target_count = int(policy["target_count"])
+    max_per = int(policy.get("max_per_cycle") or 50)
+
+    result: dict[str, Any] = {
+        "ts": time.time(),
+        "group_id": group_id,
+        "min_count": min_count,
+        "target_count": target_count,
+        "cleanup": None,
+        "register": None,
+        "need": 0,
+        "exported": 0,
+        "imported": 0,
+        "failed": 0,
+        "dry_run": dry,
+        "message": "",
+    }
+
+    # ── A. 远程测活清理 ───────────────────────────────────────────────────
+    if policy.get("enable_cleanup", True) and tgt_cfg.get("cleanup_bad", True):
+        try:
+            result["cleanup"] = target.cleanup_bad_accounts(group_id, dry_run=dry)
+            # 持久化游标，下轮继续轮询
+            if not dry and result["cleanup"] and result["cleanup"].get("next_cursor") is not None:
+                try:
+                    disk = load_json(DEFAULT_CONFIG) if DEFAULT_CONFIG.is_file() else {}
+                    disk.setdefault("target", {})["cleanup_cursor"] = int(
+                        result["cleanup"]["next_cursor"]
+                    )
+                    # 只写 cursor，不覆盖用户其它配置中的密钥逻辑
+                    if DEFAULT_CONFIG.is_file():
+                        cur_full = load_json(DEFAULT_CONFIG)
+                        cur_full.setdefault("target", {})["cleanup_cursor"] = int(
+                            result["cleanup"]["next_cursor"]
+                        )
+                        save_json(DEFAULT_CONFIG, cur_full)
+                        cfg["target"]["cleanup_cursor"] = int(result["cleanup"]["next_cursor"])
+                except Exception as e:  # noqa: BLE001
+                    log.debug("persist cleanup_cursor failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.exception("远程清理失败: %s", e)
+            result["cleanup"] = {"error": str(e)}
+    else:
+        result["cleanup"] = {"skipped": True}
+
+    current = target.count_group_accounts(group_id)
+    result["current"] = current
+    log.info(
+        "group_id=%s current=%s min=%s target=%s",
+        group_id,
+        current,
+        min_count,
+        target_count,
+    )
+
+    if not policy.get("enable_refill", True) and not policy.get("enable_register", True):
+        result["message"] = f"仅清理完成，当前 {current}"
+        return result
+
+    # 号池仍充足：默认不注册不补号（register-only 模式除外）
+    if current >= min_count and policy.get("enable_refill", True):
+        result["message"] = f"号池充足 ({current} >= {min_count})，本轮不补号"
+        log.info(result["message"])
+        return result
+
+    need = max(0, target_count - current)
+    need = min(need, max_per) if policy.get("enable_refill", True) else 0
+    result["need"] = need
+    if need <= 0 and policy.get("enable_refill", True):
+        result["message"] = "need=0"
+        return result
+
+    # ── B1. 本地不足则注册 ────────────────────────────────────────────────
+    if policy.get("enable_register", True) and src_cfg.get("auto_register", True):
+        if dry:
+            exp = source.count_exportable(limit=max(need, 50) + 20)
+            result["register"] = {
+                "dry_run": True,
+                "exportable": exp,
+                "would_register": exp < max(need, int(src_cfg.get("min_local_active") or 0)),
+            }
+            log.info("dry-run 注册检查: exportable=%s need=%s", exp, need)
+        else:
+            try:
+                result["register"] = source.ensure_local_pool(need if need > 0 else int(src_cfg.get("min_local_active") or 20))
+            except Exception as e:  # noqa: BLE001
+                log.exception("本地注册失败: %s", e)
+                result["register"] = {"error": str(e)}
+
+    if not policy.get("enable_refill", True):
+        result["message"] = "注册阶段完成（refill 已关闭）"
+        return result
+
+    if need <= 0:
+        result["message"] = f"清理后号池充足 current={current}"
+        return result
+
+    log.info("需要补充 %s 个账号", need)
+
+    # ── B2–B4 导出 → 转换 → 导入 ──────────────────────────────────────────
+    ids = source.collect_export_ids(
+        need=need,
+        status=src_cfg.get("status") or "active",
+        group=src_cfg.get("group") or "",
+        require_probe_ok=bool(src_cfg.get("require_probe_ok", True)),
+        page_size=int(src_cfg.get("export_batch_size") or 50),
+    )
+    if not ids:
+        result["message"] = "本地无可用验活账号可导出（注册后仍不足？）"
+        log.warning(result["message"])
+        return result
+
+    log.info("选中本地账号 %s 个", len(ids))
+    export_payload = source.export_by_ids(ids)
+    auth_count = int(export_payload.get("count") or len(export_payload.get("auth") or {}))
+    result["exported"] = auth_count
+    if auth_count <= 0:
+        result["message"] = "导出结果为空"
+        log.warning(result["message"])
+        return result
+
+    sub2 = convert_export_to_sub2(
+        export_payload,
+        concurrency=int(policy.get("concurrency") or 1),
+        priority=int(policy.get("priority") or 1),
+        rate_multiplier=float(policy.get("rate_multiplier") or 1.0),
+    )
+    issues = (sub2.get("_meta") or {}).get("issues") or []
+    for iss in issues[:10]:
+        log.warning("convert issue: %s", iss)
+    accounts = sub2.get("accounts") or []
+    if not accounts:
+        result["message"] = "转换后无账号"
+        return result
+
+    dump_dir = SCRIPT_DIR / "exports"
+    dump_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dump_path = dump_dir / f"sub2-import-{len(accounts)}-{stamp}.json"
+    dump_body = {
+        "exported_at": sub2["exported_at"],
+        "proxies": [],
+        "accounts": accounts,
+    }
+    with dump_path.open("w", encoding="utf-8") as f:
+        json.dump(dump_body, f, ensure_ascii=False, indent=2)
+    log.info("已写出转换文件 %s", dump_path)
+
+    if dry:
+        result["message"] = (
+            f"dry-run: 清理后 current={current}; 将导入 {len(accounts)} → group_id={group_id}"
+        )
+        log.info(result["message"])
+        return result
+
+    imp = target.import_data(
+        dump_body,
+        skip_default_group_bind=bool(tgt_cfg.get("skip_default_group_bind", True)),
+    )
+    created = int(
+        imp.get("account_created")
+        or imp.get("created")
+        or imp.get("success")
+        or 0
+    )
+    failed = int(imp.get("account_failed") or imp.get("failed") or 0)
+    result["imported"] = created
+    result["failed"] = failed
+    result["import_raw"] = {
+        k: imp.get(k)
+        for k in (
+            "account_created",
+            "account_failed",
+            "proxy_created",
+            "proxy_reused",
+            "proxy_failed",
+            "errors",
+        )
+        if k in imp
+    }
+    log.info("导入结果: created=%s failed=%s raw=%s", created, failed, result["import_raw"])
+
+    if tgt_cfg.get("bind_group_after_import") and group_id is not None:
+        emails = [
+            str((a.get("credentials") or {}).get("email") or a.get("name") or "")
+            for a in accounts
+        ]
+        emails = [e for e in emails if e]
+        new_ids = target.list_recent_account_ids(
+            group_id=None,
+            limit=len(emails),
+            search_emails=emails[: created or len(emails)],
+        )
+        if new_ids:
+            bind_res = target.bulk_bind_group(new_ids, group_id)
+            log.info("绑定分组 group_id=%s ids=%s res=%s", group_id, new_ids, bind_res)
+            result["bound_ids"] = new_ids
+        else:
+            log.warning(
+                "未能按邮箱定位新账号 id，请在后台确认是否已绑定到分组 %s",
+                group_id,
+            )
+
+    if src_cfg.get("delete_after_export") and ids:
+        del_res = source.delete_accounts(ids[:auth_count])
+        log.info("本地删除导出账号: %s", del_res)
+        result["deleted_local"] = del_res
+
+    after = target.count_group_accounts(group_id)
+    result["after"] = after
+    cu = result.get("cleanup") or {}
+    result["message"] = (
+        f"闭环完成: 删坏号≈{cu.get('deleted', 0)} · "
+        f"{current} → {after} (imported≈{created}, failed={failed})"
+    )
+    log.info(result["message"])
+    return result
+
+
+def setup_logging(cfg: dict[str, Any]) -> None:
+    level = getattr(logging, str(cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    log_file = cfg.get("logging", {}).get("file")
+    if log_file:
+        try:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except OSError as e:
+            print(f"cannot open log file: {e}", file=sys.stderr)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def write_example_config(path: Path) -> None:
+    if path.exists():
+        print(f"已存在: {path}")
+        return
+    cfg = default_config()
+    # clear secrets placeholders more clearly
+    cfg["source"]["admin_password"] = "你的本地 grok2api 管理密码"
+    cfg["target"]["email"] = "admin@example.com"
+    cfg["target"]["password"] = "你的 sub2api 管理员密码"
+    cfg["target"]["access_token"] = ""  # 优先填 JWT 可免密
+    cfg["target"]["group_name"] = "grok"
+    cfg["policy"]["min_count"] = 50
+    cfg["policy"]["target_count"] = 100
+    cfg["policy"]["interval_sec"] = 300
+    save_json(path, cfg)
+    print(f"已生成示例配置: {path}")
+    print("请填写 source.admin_password 与 target 登录信息 / group_name 后运行。")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="全自动闭环：远程测活删号 + 本地注册 + 导出导入 sub2api Grok 分组"
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=f"配置文件路径 (默认 {DEFAULT_CONFIG})",
+    )
+    parser.add_argument("--init-config", action="store_true", help="生成示例配置后退出")
+    parser.add_argument("--once", action="store_true", help="只跑一轮后退出")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="模拟：不删除/不注册/不导入，只打印将要做什么",
+    )
+    parser.add_argument("--min-count", type=int, default=None, help="低于此数量触发补号")
+    parser.add_argument("--target-count", type=int, default=None, help="补到此数量")
+    parser.add_argument("--max-per-cycle", type=int, default=None, help="单轮最多导入数")
+    parser.add_argument("--interval", type=int, default=None, help="循环间隔秒")
+    parser.add_argument("--group-name", type=str, default=None, help="远程分组名")
+    parser.add_argument("--group-id", type=int, default=None, help="远程分组 ID")
+    parser.add_argument(
+        "--skip-cleanup",
+        action="store_true",
+        help="本轮跳过远程测活删除",
+    )
+    parser.add_argument(
+        "--skip-register",
+        action="store_true",
+        help="本轮跳过本地自动注册",
+    )
+    parser.add_argument(
+        "--cleanup-only",
+        action="store_true",
+        help="只做远程坏号清理",
+    )
+    parser.add_argument(
+        "--register-only",
+        action="store_true",
+        help="只做本地注册补源",
+    )
+    args = parser.parse_args(argv)
+
+    if args.init_config:
+        write_example_config(args.config)
+        return 0
+
+    cfg = load_config(args.config, args)
+    setup_logging(cfg)
+
+    if not args.config.is_file() and not (
+        os.environ.get("SOURCE_ADMIN_PASSWORD")
+        or os.environ.get("SOURCE_ADMIN_TOKEN")
+        or os.environ.get("TARGET_ACCESS_TOKEN")
+    ):
+        log.error(
+            "找不到配置 %s。请先运行:\n  python %s --init-config",
+            args.config,
+            Path(__file__).name,
+        )
+        return 2
+
+    source = SourceClient(cfg["source"])
+    target = TargetClient(cfg["target"])
+
+    try:
+        source.login()
+        target.login()
+    except Exception as e:  # noqa: BLE001
+        log.exception("登录失败: %s", e)
+        return 1
+
+    once = bool(cfg.get("_once") or args.once)
+    interval = max(30, int(cfg["policy"].get("interval_sec") or 300))
+
+    while True:
+        try:
+            result = run_cycle(cfg, source, target)
+            state = load_json(STATE_FILE)
+            history = state.get("history") or []
+            history.append(result)
+            state["history"] = history[-100:]
+            state["last"] = result
+            save_json(STATE_FILE, state)
+        except requests.HTTPError as e:
+            log.error("HTTP 错误: %s %s", e, getattr(e.response, "text", "")[:500])
+            # re-login on 401
+            if e.response is not None and e.response.status_code == 401:
+                try:
+                    source.login()
+                    target.login()
+                except Exception:  # noqa: BLE001
+                    log.exception("重新登录失败")
+        except Exception as e:  # noqa: BLE001
+            log.exception("本轮异常: %s", e)
+
+        if once:
+            break
+        log.info("休眠 %ss …", interval)
+        time.sleep(interval)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

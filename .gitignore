@@ -1,0 +1,23 @@
+# secrets & runtime
+config.auto_refill.json
+.auto_refill_state.json
+.auto_refill.lock
+auto_refill.log
+exports/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# large / local-only
+*.zip
+*.tar.gz
+node_modules/
+data/
