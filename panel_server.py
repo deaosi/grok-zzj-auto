@@ -211,12 +211,21 @@ def _run_job(kind: str, overrides: dict[str, Any] | None = None) -> dict[str, An
         cfg["policy"]["enable_cleanup"] = False
         cfg["policy"]["enable_register"] = True
         cfg["policy"]["enable_refill"] = False
+        # panel "仅注册": always 1 account / concurrency 1 to avoid rate_limited silence
+        cfg.setdefault("source", {})
+        cfg["source"]["register_count"] = 1
+        cfg["source"]["register_concurrency"] = 1
     elif kind == "refill":
         cfg.setdefault("policy", {})
         cfg["policy"]["enable_cleanup"] = False
         cfg["policy"]["enable_register"] = True
         cfg["policy"]["enable_refill"] = True
-    # kind == "full" uses config as-is
+    # kind == "full" / loop-tick uses config as-is, but never leave refill accidentally off
+    if kind in ("full", "loop-tick"):
+        cfg.setdefault("policy", {})
+        cfg["policy"].setdefault("enable_cleanup", True)
+        cfg["policy"].setdefault("enable_register", True)
+        cfg["policy"].setdefault("enable_refill", True)
 
     source = core.SourceClient(cfg["source"])
     target = core.TargetClient(cfg["target"])
@@ -256,16 +265,46 @@ def _job_wrapper(kind: str, overrides: dict[str, Any] | None = None) -> None:
         with WORKER.lock:
             WORKER.last_result = result
             WORKER.cycle_count += 1
-        log.info("===== 任务结束: %s =====", result.get("message") or kind)
+        msg = (result or {}).get("message") or kind
+        # surface register errors clearly in log
+        reg = (result or {}).get("register") or {}
+        if isinstance(reg, dict):
+            if reg.get("error"):
+                log.error("注册错误: %s", reg.get("error"))
+            if (reg.get("batch") or {}).get("rate_limited") or (
+                reg.get("session") or {}
+            ).get("rate_limited"):
+                log.warning(
+                    "检测到 xAI rate_limited：已记录。建议并发=1、每次1~3个，稍后自动退避重试。"
+                )
+            if reg.get("message"):
+                log.info("注册详情: %s", reg.get("message"))
+            attempts = reg.get("attempts") or []
+            if attempts:
+                log.info("注册 attempts=%s", attempts)
+        if (result or {}).get("bind_ok") is False:
+            log.warning(
+                "绑组未成功，本地账号未删除。miss=%s",
+                (result or {}).get("bind_missed") or [],
+            )
+        log.info("===== 任务结束: %s =====", msg)
     except Exception as e:  # noqa: BLE001
         err = str(e) or f"{type(e).__name__}"
-        # Prefer short, actionable messages over full HTTPError dumps
         if "401" in err or "Unauthorized" in err or "密码" in err:
             log.error("任务失败: %s", err)
             log.error(
                 "提示: 本地密码必须与 http://127.0.0.1:3000/admin/login 一致；"
                 "远程填管理员邮箱密码或 JWT access_token。改完后先点「测试两边登录」。"
             )
+        elif "Mail API key" in err or "邮件 API Key" in err:
+            log.error("任务失败: %s", err)
+            log.error(
+                "提示: 到 3000 后台「协议注册」填写 cfmail api_key + 域名并保存；"
+                "不要用空配置启动注册。"
+            )
+        elif "rate_limited" in err.lower():
+            log.error("任务失败(限流): %s", err)
+            log.error("提示: xAI device 限流，请降低并发为1，等待1~3分钟再试。")
         else:
             log.error("任务失败: %s\n%s", err, traceback.format_exc()[-1200:])
         with WORKER.lock:
@@ -673,7 +712,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="row">
         <button class="warn" onclick="run('cleanup')">仅清理远程坏号</button>
-        <button onclick="run('register')">仅本地注册账号</button>
+        <button onclick="run('register')">仅本地注册（默认1个）</button>
         <button onclick="run('refill')">仅补号（含注册）</button>
         <button class="ghost" onclick="run('full', true)">模拟运行（不删不导）</button>
       </div>
@@ -738,11 +777,11 @@ PANEL_HTML = r"""<!DOCTYPE html>
           </div>
           <div>
             <label>号池下限（少于此数量开始补号）</label>
-            <input id="f-min" type="number" placeholder="例如 50" />
+            <input id="f-min" type="number" placeholder="例如 300" />
           </div>
           <div>
             <label>号池目标数量（补到多少）</label>
-            <input id="f-target" type="number" placeholder="例如 100" />
+            <input id="f-target" type="number" placeholder="例如 500" />
           </div>
           <div>
             <label>单轮最多导入数量</label>
@@ -750,11 +789,15 @@ PANEL_HTML = r"""<!DOCTYPE html>
           </div>
           <div>
             <label>循环检测间隔（秒）</label>
-            <input id="f-interval" type="number" placeholder="例如 300" />
+            <input id="f-interval" type="number" placeholder="例如 180" />
           </div>
           <div>
-            <label>本地每次注册数量</label>
-            <input id="f-reg-count" type="number" placeholder="例如 50" />
+            <label>本地每次注册数量（建议1~3，防 rate_limited）</label>
+            <input id="f-reg-count" type="number" placeholder="例如 3" />
+          </div>
+          <div>
+            <label>本地注册并发（建议1）</label>
+            <input id="f-reg-conc" type="number" placeholder="例如 1" />
           </div>
           <div>
             <label>远程测活并发数</label>
@@ -850,11 +893,12 @@ function fillForm(cfg) {
   $("f-tgt-token").value = "";
   $("f-group-name").value = t.group_name || "";
   $("f-group-id").value = t.group_id == null ? "" : t.group_id;
-  $("f-min").value = p.min_count ?? 50;
-  $("f-target").value = p.target_count ?? 100;
+  $("f-min").value = p.min_count ?? 300;
+  $("f-target").value = p.target_count ?? 500;
   $("f-max").value = p.max_per_cycle ?? 50;
-  $("f-interval").value = p.interval_sec ?? 300;
-  $("f-reg-count").value = s.register_count ?? 50;
+  $("f-interval").value = p.interval_sec ?? 180;
+  $("f-reg-count").value = s.register_count ?? 3;
+  if ($("f-reg-conc")) $("f-reg-conc").value = s.register_concurrency ?? 1;
   $("f-clean-workers").value = t.cleanup_workers ?? 6;
   if ($("f-clean-max")) $("f-clean-max").value = t.cleanup_max ?? 60;
   if ($("f-clean-timeout")) $("f-clean-timeout").value = t.cleanup_timeout_sec ?? 45;
@@ -869,7 +913,8 @@ function collectFormPatch() {
   const patch = {
     source: {
       base_url: $("f-src-url").value.trim(),
-      register_count: Number($("f-reg-count").value || 50),
+      register_count: Math.max(1, Math.min(10, Number($("f-reg-count").value || 3))),
+      register_concurrency: Math.max(1, Math.min(2, Number(($("f-reg-conc") && $("f-reg-conc").value) || 1))),
       auto_register: $("f-register").checked,
       delete_after_export: $("f-del-local").checked,
     },
@@ -1022,8 +1067,21 @@ async function run(kind, forceDry) {
       method: "POST",
       body: JSON.stringify({ kind, dry_run: !!dry }),
     });
-    toast(`任务 ${kind} 已开始`, true);
-    setTimeout(refreshAll, 800);
+    toast(`任务 ${kind} 已开始，请看下方日志…`, true);
+    // poll a few times so user sees real result/error without manual refresh
+    let n = 0;
+    const timer = setInterval(async () => {
+      n += 1;
+      await refreshAll();
+      try {
+        const st = await api("/api/status");
+        if (!st.busy || n >= 30) {
+          clearInterval(timer);
+          const msg = (st.last_result && st.last_result.message) || st.last_error || "任务结束";
+          toast(msg, !st.last_error);
+        }
+      } catch (_) {}
+    }, 2000);
   } catch (e) {
     toast(e.message, false);
   }

@@ -274,20 +274,23 @@ def default_config() -> dict[str, Any]:
             "local_buffer": 20,
             # 自动注册
             "auto_register": True,
-            "register_count": 40,  # 每次注册数量（local Turnstile 建议 ≤50）
-            "register_concurrency": 2,  # 本地 camoufox 建议 1~3
-            "register_stagger_ms": 800,
+            "register_count": 3,  # 每次注册数量（local + 防 rate_limited 建议 1~5）
+            "register_concurrency": 1,  # 本地 camoufox / xAI device 建议 1
+            "register_stagger_ms": 1200,
             "register_probe_delay_sec": 30,
             # 空 body 会用后台已保存的 registration_config（邮件/打码/代理）
             "register_body": {},
-            "register_poll_interval_sec": 15,
-            "register_timeout_sec": 3600,
+            "register_poll_interval_sec": 10,
+            "register_timeout_sec": 1800,
             # 注册完成后等待秒数再导出（给 probe 时间）
-            "register_settle_sec": 45,
+            "register_settle_sec": 30,
             # 注册前检查本地是否过载；过载则跳过本轮注册
             "register_health_gate": True,
-            "register_max_active_sessions": 8,
-            "register_max_cpu_skip": False,  # 需要 docker stats 时再开
+            "register_max_active_sessions": 4,
+            # rate_limited 退避
+            "register_rate_limit_retries": 3,
+            "register_rate_limit_backoff_sec": 90,
+            "register_max_cpu_skip": False,
         },
         # 远程 sub2api（号池目标）
         "target": {
@@ -777,21 +780,53 @@ class SourceClient:
                 raise
             except Exception as e:  # noqa: BLE001
                 log.warning("register health gate skipped: %s", e)
+
+        # Pull saved registration config and inject secrets into start body.
+        # Avoid empty overrides that can wipe stored keys on older backends.
         body = dict(self.cfg.get("register_body") or {})
-        n = int(count if count is not None else (self.cfg.get("register_count") or 40))
-        body.setdefault("count", n)
-        # local solver is single-browser-ish — keep concurrency low
-        body.setdefault(
-            "concurrency",
-            min(3, int(self.cfg.get("register_concurrency") or 2)),
-        )
-        body.setdefault(
-            "stagger_ms", int(self.cfg.get("register_stagger_ms") or 800)
-        )
-        body.setdefault(
-            "probe_delay_sec",
-            int(self.cfg.get("register_probe_delay_sec") or 30),
-        )
+        try:
+            saved = self.s.get(
+                f"{self.base}/admin/api/accounts/register-email/config",
+                headers=self._headers(),
+                timeout=30,
+            )
+            if saved.status_code == 200:
+                sc = (saved.json() or {}).get("config") or {}
+                # only fill missing keys; never send empty secret placeholders
+                for k in (
+                    "mail_provider",
+                    "base_url",
+                    "domain",
+                    "cfmail_domain",
+                    "captcha_provider",
+                    "local_solver_url",
+                    "proxy",
+                    "proxy_username",
+                    "proxy_password",
+                    "expiry_ms",
+                ):
+                    if k not in body or body.get(k) in (None, ""):
+                        if sc.get(k) not in (None, ""):
+                            body[k] = sc.get(k)
+                # secrets: only if look unmasked and non-empty
+                for k in ("api_key", "cfmail_api_key", "moemail_api_key", "yescaptcha_key"):
+                    v = sc.get(k)
+                    if not v or not isinstance(v, str):
+                        continue
+                    if "…" in v or v == "****" or set(v) <= {"*"}:
+                        continue
+                    if k not in body or body.get(k) in (None, ""):
+                        body[k] = v
+        except Exception as e:  # noqa: BLE001
+            log.warning("load register config for start body failed: %s", e)
+
+        n = int(count if count is not None else (self.cfg.get("register_count") or 3))
+        n = max(1, min(n, 10))  # hard safety for local captcha / xAI rate limits
+        body["count"] = n
+        body["concurrency"] = max(1, min(2, int(self.cfg.get("register_concurrency") or 1)))
+        body["stagger_ms"] = int(self.cfg.get("register_stagger_ms") or 1200)
+        body["probe_delay_sec"] = int(self.cfg.get("register_probe_delay_sec") or 30)
+
         r = self.s.post(
             f"{self.base}/admin/api/accounts/register-email",
             headers={**self._headers(), "Content-Type": "application/json"},
@@ -901,8 +936,8 @@ class SourceClient:
         self,
         batch_id: str,
         *,
-        timeout_sec: int = 3600,
-        poll_sec: int = 15,
+        timeout_sec: int = 1800,
+        poll_sec: int = 10,
     ) -> dict[str, Any]:
         terminal = {
             "done",
@@ -913,6 +948,7 @@ class SourceClient:
             "failed",
             "cancelled",
             "stopped",
+            "partial",
         }
         started = time.time()
         last: dict[str, Any] = {}
@@ -923,10 +959,10 @@ class SourceClient:
                 log.warning("poll batch %s: %s", batch_id, e)
                 time.sleep(poll_sec)
                 continue
-            st = str(last.get("status") or "").lower()
-            finished = int(last.get("finished") or 0)
-            count = int(last.get("count") or 0)
-            ok_c = int(last.get("ok_count") or 0)
+            st = str(last.get("status") or last.get("batch_status") or "").lower()
+            finished = int(last.get("finished") or last.get("done") or 0)
+            count = int(last.get("count") or last.get("total") or 0)
+            ok_c = int(last.get("ok_count") or last.get("imported") or 0)
             fail_c = int(last.get("fail_count") or 0)
             log.info(
                 "注册批次 %s status=%s finished=%s/%s ok=%s fail=%s",
@@ -937,27 +973,58 @@ class SourceClient:
                 ok_c,
                 fail_c,
             )
-            if st in terminal or (count > 0 and finished >= count and st not in ("running", "starting", "queued", "spawning")):
+            if self._looks_rate_limited(last):
+                last["rate_limited"] = True
+            if st in terminal or (
+                count > 0
+                and finished >= count
+                and st not in ("running", "starting", "queued", "spawning", "stopping")
+            ):
                 return last
-            # also treat runner_alive=false + finished>=count
             if last.get("runner_alive") is False and count and finished >= count:
                 return last
             time.sleep(max(3, poll_sec))
         last["timeout"] = True
         return last
 
+    def _looks_rate_limited(self, payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("rate_limited"):
+            return True
+        parts: list[str] = []
+        for k in ("message", "error", "detail"):
+            if payload.get(k) is not None:
+                parts.append(str(payload.get(k)))
+        se = payload.get("spawn_errors")
+        if isinstance(se, list):
+            parts.extend(str(x) for x in se)
+        elif se:
+            parts.append(str(se))
+        for s in payload.get("sessions") or []:
+            if isinstance(s, dict):
+                parts.append(str(s.get("error") or ""))
+                parts.append(str(s.get("message") or ""))
+        text = " ".join(parts).lower()
+        return (
+            "rate_limited" in text
+            or "rate limit" in text
+            or "error=rate_limited" in text
+        )
+
     def ensure_local_pool(self, need_export: int) -> dict[str, Any]:
-        """If exportable accounts < need, start registration batch and wait."""
+        """If exportable accounts < need, register with rate-limit backoff."""
         out: dict[str, Any] = {
             "exportable_before": 0,
             "registered": False,
             "batch_id": None,
             "batch": None,
+            "attempts": [],
         }
         if not self.cfg.get("auto_register", True):
             out["skipped"] = "auto_register=false"
             return out
-        # 只数到 need+缓冲，避免全表扫描
+
         scan_limit = max(need_export + 20, int(self.cfg.get("min_local_active") or 30) + 10, 50)
         exportable = self.count_exportable(limit=scan_limit)
         out["exportable_before"] = exportable
@@ -966,51 +1033,144 @@ class SourceClient:
         if exportable >= threshold:
             out["message"] = f"本地可导出 {exportable} >= {threshold}"
             return out
-        reg_count = int(self.cfg.get("register_count") or 50)
-        # 只补缺口，不要 max(缺口, reg_count) 造成一次注册过多
+
+        # keep batches tiny to reduce xAI device rate limits
+        base_count = max(1, min(int(self.cfg.get("register_count") or 3), 10))
         deficit = max(1, threshold - exportable)
-        reg_n = min(max(reg_count, deficit), max(reg_count * 2, deficit))
-        # 硬上限，防止配置失误一次注册上千
-        reg_n = min(reg_n, 200)
-        log.info(
-            "本地可导出不足 (%s < %s)，启动注册 ×%s",
-            exportable,
-            threshold,
-            reg_n,
-        )
-        started = self.start_registration(reg_n)
-        batch_id = started.get("batch_id") or (started.get("batch") or {}).get("id")
-        out["registered"] = True
-        out["batch_id"] = batch_id
-        out["register_count"] = reg_n
-        out["start"] = {
-            k: started.get(k)
-            for k in ("ok", "count", "concurrency", "message", "batch_id")
-        }
-        if not batch_id:
-            # single-session fallback
+        reg_n = min(base_count, deficit, 10)
+        retries = max(1, int(self.cfg.get("register_rate_limit_retries") or 3))
+        backoff = max(30, int(self.cfg.get("register_rate_limit_backoff_sec") or 90))
+
+        for attempt in range(1, retries + 1):
+            this_n = 1 if attempt > 1 else reg_n
+            log.info(
+                "本地可导出不足 (%s < %s)，注册 attempt %s/%s ×%s",
+                exportable,
+                threshold,
+                attempt,
+                retries,
+                this_n,
+            )
+            try:
+                started = self.start_registration(this_n)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                out["attempts"].append({"attempt": attempt, "error": msg[:300]})
+                if "mail api key" in msg.lower():
+                    out["message"] = msg
+                    raise
+                if attempt < retries and (
+                    "rate_limited" in msg.lower() or "rate limit" in msg.lower() or "400" in msg
+                ):
+                    log.warning("注册启动失败: %s；%ss 后重试", msg[:160], backoff * attempt)
+                    time.sleep(backoff * attempt)
+                    continue
+                raise
+
+            batch_id = started.get("batch_id") or (started.get("batch") or {}).get("id")
             sid = started.get("id") or started.get("session_id")
-            out["session_id"] = sid
-            log.warning("未返回 batch_id，session=%s raw_keys=%s", sid, list(started)[:20])
-            settle = int(self.cfg.get("register_settle_sec") or 45)
-            time.sleep(settle)
-            return out
-        batch = self.wait_registration(
-            str(batch_id),
-            timeout_sec=int(self.cfg.get("register_timeout_sec") or 3600),
-            poll_sec=int(self.cfg.get("register_poll_interval_sec") or 15),
-        )
-        out["batch"] = {
-            "status": batch.get("status"),
-            "finished": batch.get("finished"),
-            "ok_count": batch.get("ok_count"),
-            "fail_count": batch.get("fail_count"),
-            "timeout": batch.get("timeout"),
-        }
-        settle = int(self.cfg.get("register_settle_sec") or 45)
+            out["registered"] = True
+            out["batch_id"] = batch_id
+            out["register_count"] = this_n
+            out["start"] = {
+                k: started.get(k)
+                for k in ("ok", "count", "concurrency", "message", "batch_id", "id", "status")
+            }
+            out["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "count": this_n,
+                    "batch_id": batch_id,
+                    "session_id": sid,
+                }
+            )
+
+            # single-session path
+            if not batch_id and sid:
+                deadline = time.time() + int(self.cfg.get("register_timeout_sec") or 1800)
+                final_sess: dict[str, Any] = {}
+                while time.time() < deadline:
+                    try:
+                        rr = self.s.get(
+                            f"{self.base}/admin/api/accounts/register-email/sessions/{sid}",
+                            headers=self._headers(),
+                            timeout=30,
+                        )
+                        if rr.status_code < 400:
+                            final_sess = rr.json() if rr.content else {}
+                            st = str(final_sess.get("status") or "").lower()
+                            log.info("注册会话 %s status=%s", sid, st)
+                            if self._looks_rate_limited(final_sess):
+                                final_sess["rate_limited"] = True
+                                break
+                            if st in {
+                                "imported",
+                                "error",
+                                "failed",
+                                "cancelled",
+                                "stopped",
+                                "done",
+                                "success",
+                                "completed",
+                            }:
+                                break
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("poll session %s: %s", sid, e)
+                    time.sleep(8)
+                out["session"] = {
+                    "id": sid,
+                    "status": final_sess.get("status"),
+                    "error": final_sess.get("error"),
+                    "message": final_sess.get("message"),
+                    "rate_limited": bool(final_sess.get("rate_limited"))
+                    or self._looks_rate_limited(final_sess),
+                }
+                if out["session"]["rate_limited"] and attempt < retries:
+                    log.warning(
+                        "检测到 rate_limited（session），退避 %ss 后重试…",
+                        backoff * attempt,
+                    )
+                    time.sleep(backoff * attempt)
+                    continue
+                break
+
+            if not batch_id:
+                log.warning("未返回 batch_id/session_id raw_keys=%s", list(started)[:20])
+                break
+
+            batch = self.wait_registration(
+                str(batch_id),
+                timeout_sec=int(self.cfg.get("register_timeout_sec") or 1800),
+                poll_sec=int(self.cfg.get("register_poll_interval_sec") or 10),
+            )
+            ok_c = int(batch.get("ok_count") or batch.get("imported") or 0)
+            rate_hit = self._looks_rate_limited(batch)
+            out["batch"] = {
+                "status": batch.get("status") or batch.get("batch_status"),
+                "finished": batch.get("finished"),
+                "ok_count": ok_c,
+                "fail_count": batch.get("fail_count"),
+                "timeout": batch.get("timeout"),
+                "rate_limited": rate_hit,
+                "spawn_errors": (batch.get("spawn_errors") or [])[:5],
+                "message": batch.get("message"),
+            }
+            if rate_hit and ok_c <= 0 and attempt < retries:
+                log.warning(
+                    "批次 rate_limited 且 ok=0，退避 %ss 后以更小批量重试…",
+                    backoff * attempt,
+                )
+                time.sleep(backoff * attempt)
+                continue
+            break
+
+        settle = int(self.cfg.get("register_settle_sec") or 30)
         log.info("注册结束，等待 settle %ss 以便 probe 完成…", settle)
         time.sleep(max(0, settle))
         out["exportable_after"] = self.count_exportable(limit=scan_limit)
+        out["message"] = (
+            f"注册结束 exportable {out['exportable_before']}→{out.get('exportable_after')}"
+        )
         return out
 
 
