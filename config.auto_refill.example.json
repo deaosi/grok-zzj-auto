@@ -12,8 +12,8 @@
     "min_local_active": 50,
     "local_buffer": 20,
     "auto_register": true,
-    "register_count": 3,
-    "register_concurrency": 1,
+    "register_count": 40,
+    "register_concurrency": 2,
     "register_stagger_ms": 800,
     "register_probe_delay_sec": 30,
     "register_body": {},
@@ -21,9 +21,7 @@
     "register_timeout_sec": 3600,
     "register_settle_sec": 45,
     "register_health_gate": true,
-    "register_max_active_sessions": 8,
-    "register_rate_limit_retries": 3,
-    "register_rate_limit_backoff_sec": 90
+    "register_max_active_sessions": 8
   },
   "target": {
     "base_url": "https://fd.diamondruby.xyz",
@@ -44,12 +42,7 @@
     "cleanup_fail_delete": true,
     "cleanup_fail_streak": 2,
     "cleanup_page_size": 100,
-    "cleanup_prefer_status": [
-      "error",
-      "inactive",
-      "expired",
-      "quota_exhausted"
-    ]
+    "cleanup_prefer_status": ["error", "inactive", "expired", "quota_exhausted"]
   },
   "policy": {
     "min_count": 300,

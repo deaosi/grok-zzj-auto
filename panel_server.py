@@ -823,8 +823,9 @@ PANEL_HTML = r"""<!DOCTYPE html>
           <button class="ghost" onclick="loadConfig()">重新加载</button>
         </div>
         <div class="msg" style="margin-top:10px;font-size:.8rem">
-          优化说明：测活改为「每轮抽样 + 游标轮询」，不再全量扫；注册按缺口补，单次默认 50。
+          说明：测活按「每轮抽样 + 游标」；注册建议并发 1、每次 1~3 个（防 xAI rate_limited）。
           本地密码需能打开 <code>http://127.0.0.1:3000/admin/login</code>。
+          每个按钮都会在上方状态条与下方日志给出结果。
         </div>
       </div>
       <div id="tab-json" style="display:none">
@@ -852,6 +853,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 let CFG = null;
 let logTotal = 0;
 let logPaused = false;
+let _busyUi = false;
 
 function $(id) { return document.getElementById(id); }
 
@@ -861,14 +863,41 @@ function toast(msg, ok) {
   el.className = "msg " + (ok === true ? "ok" : ok === false ? "err" : "");
 }
 
+function setActionBusy(busy, label) {
+  _busyUi = !!busy;
+  const ids = [
+    "btn-loop-start", "btn-loop-stop", "btn-run-full"
+  ];
+  // disable action buttons while a request in flight (status poll also manages)
+  document.querySelectorAll("button").forEach((b) => {
+    if (!b) return;
+    if (b.closest(".tabs")) return; // keep tab switch
+    if (busy) {
+      if (!b.dataset._prevDisabled) b.dataset._prevDisabled = b.disabled ? "1" : "0";
+      // keep stop enabled during loop
+      if (b.id === "btn-loop-stop") {
+        b.disabled = false;
+        return;
+      }
+      b.disabled = true;
+    } else if (b.dataset._prevDisabled != null) {
+      // leave actual enablement to setButtons/refreshStatus
+      delete b.dataset._prevDisabled;
+    }
+  });
+  if (label) toast(label, null);
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
   });
-  const data = await res.json().catch(() => ({}));
+  let data = {};
+  const text = await res.text();
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { detail: text.slice(0, 300) }; }
   if (!res.ok) {
-    const msg = data.detail || data.message || res.statusText;
+    const msg = data.detail || data.message || res.statusText || ("HTTP " + res.status);
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
   return data;
@@ -880,6 +909,7 @@ function switchTab(name) {
   document.querySelectorAll(".tabs button").forEach(b => {
     b.classList.toggle("active", b.dataset.tab === name);
   });
+  toast(name === "form" ? "已切换到简易表单" : "已切换到高级 JSON", true);
 }
 
 function fillForm(cfg) {
@@ -949,16 +979,30 @@ function collectFormPatch() {
 }
 
 async function loadConfig() {
-  const data = await api("/api/config?mask=true");
-  $("cfg-path").textContent = data.path || "";
-  fillForm(data.config);
+  try {
+    setActionBusy(true, "正在加载配置…");
+    const data = await api("/api/config?mask=true");
+    $("cfg-path").textContent = data.path || "";
+    fillForm(data.config);
+    toast("配置已重新加载", true);
+  } catch (e) {
+    toast("加载配置失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
+  }
 }
 
 async function saveForm() {
   try {
-    // merge patch onto current full masked config, then server keeps secrets
+    setActionBusy(true, "正在保存配置…");
     const base = CFG || (await api("/api/config?mask=true")).config;
     const patch = collectFormPatch();
+    if (!patch.source.base_url || !patch.target.base_url) {
+      throw new Error("本地/远程地址不能为空");
+    }
+    if (Number(patch.policy.min_count) > Number(patch.policy.target_count)) {
+      throw new Error("号池下限不能大于目标数量");
+    }
     const merged = {
       ...base,
       source: { ...(base.source || {}), ...patch.source },
@@ -968,29 +1012,35 @@ async function saveForm() {
     };
     const r = await api("/api/config", { method: "PUT", body: JSON.stringify({ config: merged }) });
     fillForm(r.config);
-    toast("配置已保存", true);
+    toast("配置已保存（密码留空则保持原值）", true);
+    await refreshStatus();
   } catch (e) {
     toast("保存失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
 async function saveJson() {
   try {
+    setActionBusy(true, "正在保存 JSON…");
     const cfg = JSON.parse($("cfg-json").value);
     const r = await api("/api/config", { method: "PUT", body: JSON.stringify({ config: cfg }) });
     fillForm(r.config);
     toast("JSON 配置已保存", true);
   } catch (e) {
     toast("保存失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
 function setButtons(st) {
-  const busy = !!st.busy;
+  const busy = !!st.busy || _busyUi;
   const running = !!st.running;
-  $("btn-loop-start").disabled = running || busy;
-  $("btn-loop-stop").disabled = !running;
-  $("btn-run-full").disabled = busy || running;
+  if ($("btn-loop-start")) $("btn-loop-start").disabled = running || busy;
+  if ($("btn-loop-stop")) $("btn-loop-stop").disabled = !running && !busy ? true : !running;
+  if ($("btn-run-full")) $("btn-run-full").disabled = busy || running;
 }
 
 async function refreshStatus() {
@@ -1057,59 +1107,70 @@ async function refreshLogs() {
 
 function clearLogView() {
   $("log").innerHTML = "";
+  toast("日志视图已清空（不影响文件日志）", true);
 }
 
 async function run(kind, forceDry) {
   const dry = forceDry || $("opt-dry").checked;
+  const names = { full: "完整闭环", cleanup: "仅清理坏号", register: "仅本地注册", refill: "仅补号" };
   try {
-    toast(`启动任务 ${kind}${dry ? " (dry-run)" : ""}…`);
+    setActionBusy(true, `启动任务：${names[kind] || kind}${dry ? "（模拟）" : ""}…`);
     await api("/api/run", {
       method: "POST",
       body: JSON.stringify({ kind, dry_run: !!dry }),
     });
-    toast(`任务 ${kind} 已开始，请看下方日志…`, true);
-    // poll a few times so user sees real result/error without manual refresh
+    toast(`任务「${names[kind] || kind}」已开始，请看下方日志…`, true);
     let n = 0;
     const timer = setInterval(async () => {
       n += 1;
       await refreshAll();
       try {
         const st = await api("/api/status");
-        if (!st.busy || n >= 30) {
+        if (!st.busy || n >= 60) {
           clearInterval(timer);
+          setActionBusy(false);
           const msg = (st.last_result && st.last_result.message) || st.last_error || "任务结束";
           toast(msg, !st.last_error);
         }
-      } catch (_) {}
+      } catch (_) {
+        if (n >= 60) { clearInterval(timer); setActionBusy(false); }
+      }
     }, 2000);
   } catch (e) {
-    toast(e.message, false);
+    setActionBusy(false);
+    toast("启动失败: " + e.message, false);
   }
 }
 
 async function loopStart() {
   try {
-    await api("/api/loop/start", { method: "POST", body: "{}" });
-    toast("循环已启动", true);
-    refreshStatus();
+    setActionBusy(true, "正在启动循环…");
+    const r = await api("/api/loop/start", { method: "POST", body: "{}" });
+    toast(r.message || "循环已启动", true);
+    await refreshStatus();
   } catch (e) {
-    toast(e.message, false);
+    toast("启动循环失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
 async function loopStop() {
   try {
-    await api("/api/loop/stop", { method: "POST", body: "{}" });
-    toast("已请求停止循环", true);
-    refreshStatus();
+    setActionBusy(true, "正在停止循环…");
+    const r = await api("/api/loop/stop", { method: "POST", body: "{}" });
+    toast(r.message || "已请求停止循环", true);
+    await refreshStatus();
   } catch (e) {
-    toast(e.message, false);
+    toast("停止失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
 async function testLogin() {
   try {
-    toast("测试登录中…");
+    setActionBusy(true, "测试登录中…");
     const r = await api("/api/test-login", {
       method: "POST",
       body: JSON.stringify({ which: "both" }),
@@ -1117,30 +1178,34 @@ async function testLogin() {
     const parts = [];
     if (r.source) {
       parts.push(r.source.ok
-        ? `本地✓ (hint=${r.source.total_hint})`
+        ? `本地✓ (账号提示=${r.source.total_hint})`
         : `本地✗ ${r.source.error}`);
     }
     if (r.target) {
       parts.push(r.target.ok
-        ? `远程✓ group=${r.target.group_id} count=${r.target.count}`
+        ? `远程✓ 分组=${r.target.group_id} 数量=${r.target.count}`
         : `远程✗ ${r.target.error}`);
     }
     const ok = (r.source?.ok !== false) && (r.target?.ok !== false);
     toast(parts.join(" · "), ok);
     if (r.target?.ok) $("s-group").textContent = r.target.group_id;
   } catch (e) {
-    toast(e.message, false);
+    toast("测试登录失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
 async function fixLocal() {
   try {
-    toast("正在急救本地注册会话…");
+    setActionBusy(true, "正在急救本地注册会话…");
     const r = await api("/api/fix-local", { method: "POST", body: "{}" });
     toast(r.message || "急救完成", !!r.ok);
-    refreshAll();
+    await refreshAll();
   } catch (e) {
     toast("急救失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
   }
 }
 
@@ -1148,7 +1213,17 @@ async function refreshAll() {
   await Promise.all([refreshStatus(), refreshLogs(), refreshHistory()]);
 }
 
-loadConfig().then(refreshAll).catch(e => toast("初始化失败: " + e.message, false));
+(async () => {
+  try {
+    const data = await api("/api/config?mask=true");
+    $("cfg-path").textContent = data.path || "";
+    fillForm(data.config);
+    await refreshAll();
+    toast("控制台已就绪", true);
+  } catch (e) {
+    toast("初始化失败: " + e.message, false);
+  }
+})();
 setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 1500);
 setInterval(refreshHistory, 8000);
