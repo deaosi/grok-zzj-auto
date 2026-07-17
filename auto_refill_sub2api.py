@@ -287,19 +287,19 @@ def default_config() -> dict[str, Any]:
             "local_buffer": 20,
             # 自动注册
             "auto_register": True,
-            "register_count": 8,  # 稳速：8 个/批（够数会提前结束等待）
-            "register_concurrency": 2,  # 稳速甜蜜点（3+ 失败率明显升）
-            "register_stagger_ms": 700,
-            "register_probe_delay_sec": 20,
+            "register_count": 12,  # 提速：12/批，够数 early-stop
+            "register_concurrency": 3,  # 提速并发
+            "register_stagger_ms": 500,
+            "register_probe_delay_sec": 15,
             # 空 body 会用后台已保存的 registration_config（邮件/打码/代理）
             "register_body": {},
             "register_poll_interval_sec": 8,
-            "register_timeout_sec": 900,
+            "register_timeout_sec": 720,
             # 注册完成后等待秒数再导出（给 probe 时间）
-            "register_settle_sec": 15,
+            "register_settle_sec": 12,
             # 注册前检查本地是否过载；过载则跳过本轮注册
             "register_health_gate": True,
-            "register_max_active_sessions": 6,
+            "register_max_active_sessions": 10,
             # rate_limited 退避
             "register_rate_limit_retries": 3,
             "register_rate_limit_backoff_sec": 60,
@@ -340,7 +340,7 @@ def default_config() -> dict[str, Any]:
             "cleanup_fail_streak": 2,
             "cleanup_delete_unschedulable": True,
             "cleanup_delete_error_message": True,
-            "cleanup_metadata_max": 100,
+            "cleanup_metadata_max": 500,
             # 游标改存 .auto_refill_state.json（此处仅兼容读旧配置）
             "cleanup_cursor": 0,
             # 优先测这些状态（空=只按 active/全部分页）
@@ -787,6 +787,146 @@ class SourceClient:
         )
         return len(ids)
 
+
+    def check_registration_health(self, *, auto_fix: bool = True) -> dict[str, Any]:
+        """Health-check local registration machine; optionally fix stuck sessions."""
+        out: dict[str, Any] = {
+            "ok": True,
+            "checks": {},
+            "issues": [],
+            "fixes": [],
+            "ts": time.time(),
+        }
+        try:
+            ss = self.get_registration_sessions(limit=50, active_only=False)
+            out["checks"]["sessions_api"] = True
+            out["checks"]["available"] = ss.get("available")
+            out["checks"]["captcha_provider"] = ss.get("captcha_provider")
+            out["checks"]["local_solver_configured"] = ss.get("local_solver_configured")
+            out["checks"]["engine"] = ss.get("engine")
+            if ss.get("available") is False:
+                out["ok"] = False
+                out["issues"].append("registration adapter unavailable")
+        except Exception as e:  # noqa: BLE001
+            out["ok"] = False
+            out["checks"]["sessions_api"] = False
+            out["issues"].append(f"sessions api: {e}")
+            ss = {"sessions": []}
+
+        try:
+            r = self.s.get(
+                f"{self.base}/admin/api/accounts/register-email/config",
+                headers=self._headers(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            cfg = (r.json() or {}).get("config") or {}
+            out["checks"]["mail_provider"] = cfg.get("mail_provider")
+            out["checks"]["domain"] = cfg.get("domain") or cfg.get("cfmail_domain")
+            out["checks"]["captcha_provider_cfg"] = cfg.get("captcha_provider")
+            out["checks"]["local_solver_url"] = cfg.get("local_solver_url")
+            key = (
+                cfg.get("api_key")
+                or cfg.get("cfmail_api_key")
+                or cfg.get("moemail_api_key")
+                or ""
+            )
+            key_ok = bool(str(key).strip())
+            out["checks"]["api_key_present"] = key_ok
+            if not key_ok:
+                out["ok"] = False
+                out["issues"].append("mail api_key missing/empty")
+            prov = str(cfg.get("mail_provider") or "").lower()
+            dom = cfg.get("domain") or cfg.get("cfmail_domain") or cfg.get("moemail_domain")
+            if prov in {"cfmail", "moemail", ""} and not dom:
+                out["issues"].append("mail domain empty")
+            cap = str(
+                cfg.get("captcha_provider")
+                or ss.get("captcha_provider")
+                or ""
+            ).lower()
+            out["checks"]["captcha"] = cap or "unknown"
+        except Exception as e:  # noqa: BLE001
+            out["ok"] = False
+            out["issues"].append(f"config api: {e}")
+
+        terminal = {
+            "imported",
+            "error",
+            "done",
+            "finished",
+            "completed",
+            "cancelled",
+            "stopped",
+            "success",
+            "failed",
+        }
+        sessions = ss.get("sessions") or []
+        active = [
+            x
+            for x in sessions
+            if str(x.get("status") or "").lower() not in terminal
+        ]
+        stuck = []
+        now = time.time()
+        for x in active:
+            age = now - float(x.get("updated_at") or x.get("created_at") or now)
+            st = str(x.get("status") or "").lower()
+            if age > 300 or (
+                st in {"solving_turnstile", "stopping", "queued"} and age > 180
+            ):
+                stuck.append(
+                    {"id": x.get("id"), "status": st, "age_s": int(age)}
+                )
+        out["checks"]["active_sessions"] = len(active)
+        out["checks"]["stuck_sessions"] = len(stuck)
+        if stuck:
+            out["issues"].append(f"stuck registration sessions: {len(stuck)}")
+            if auto_fix:
+                try:
+                    stop = self.stop_all_registrations()
+                    out["fixes"].append(
+                        {"action": "stop_all_registrations", "result": stop}
+                    )
+                    time.sleep(1.0)
+                    ss2 = self.get_registration_sessions(limit=50, active_only=False)
+                    active2 = [
+                        x
+                        for x in (ss2.get("sessions") or [])
+                        if str(x.get("status") or "").lower() not in terminal
+                    ]
+                    out["checks"]["active_sessions_after_fix"] = len(active2)
+                    max_active = int(self.cfg.get("register_max_active_sessions") or 8)
+                    if len(active2) > max_active:
+                        out["ok"] = False
+                        out["issues"].append(
+                            f"still too many active sessions after stop: {len(active2)}"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    out["ok"] = False
+                    out["issues"].append(f"auto fix stop failed: {e}")
+
+        if (
+            out["checks"].get("local_solver_configured") is False
+            and str(out["checks"].get("captcha") or "").lower() == "local"
+        ):
+            out["ok"] = False
+            out["issues"].append("local solver not configured")
+
+        # if only stuck issues and fixed, mark ok
+        hard = [i for i in out["issues"] if "stuck registration sessions" not in i]
+        if hard:
+            out["ok"] = False
+        elif out["ok"] is not False:
+            out["ok"] = True
+
+        out["message"] = (
+            "registration healthy"
+            if out["ok"]
+            else ("registration unhealthy: " + "; ".join(out["issues"][:5]))
+        )
+        return out
+
     def start_registration(self, count: int | None = None) -> dict[str, Any]:
         # Health gate: stop leftover sessions / refuse when too many active
         if self.cfg.get("register_health_gate", True):
@@ -839,10 +979,10 @@ class SourceClient:
             log.warning("load register config for start body failed: %s", e)
 
         n = int(count if count is not None else (self.cfg.get("register_count") or 8))
-        n = max(1, min(n, 20))  # hard safety cap per batch (local turnstile)
+        n = max(1, min(n, 25))  # hard safety cap per batch (local turnstile)
         body["count"] = n
         # sweet spot: 2 is usually faster+stabler than 3~5 under local camoufox
-        body["concurrency"] = max(1, min(3, int(self.cfg.get("register_concurrency") or 2)))
+        body["concurrency"] = max(1, min(5, int(self.cfg.get("register_concurrency") or 4)))
         body["stagger_ms"] = int(self.cfg.get("register_stagger_ms") or 700)
         body["probe_delay_sec"] = int(self.cfg.get("register_probe_delay_sec") or 20)
         # force local turnstile — mis-set yescaptcha causes long timeouts & "no progress"
@@ -1091,6 +1231,25 @@ class SourceClient:
             out["skipped"] = "auto_register=false"
             return out
 
+        if self.cfg.get("register_health_check", True):
+            try:
+                health = self.check_registration_health(auto_fix=True)
+                out["health"] = {
+                    "ok": health.get("ok"),
+                    "message": health.get("message"),
+                    "issues": health.get("issues"),
+                    "fixes": health.get("fixes"),
+                    "active": (health.get("checks") or {}).get("active_sessions"),
+                    "stuck": (health.get("checks") or {}).get("stuck_sessions"),
+                }
+                if not health.get("ok"):
+                    out["message"] = health.get("message") or "registration unhealthy"
+                    log.error("注册机自检失败: %s", out["message"])
+                    return out
+                log.info("注册机自检通过: %s", health.get("message"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("注册机自检异常(继续尝试注册): %s", e)
+
         scan_limit = max(need_export + 20, int(self.cfg.get("min_local_active") or 30) + 10, 50)
         exportable = self.count_exportable(limit=scan_limit)
         out["exportable_before"] = exportable
@@ -1101,7 +1260,7 @@ class SourceClient:
             return out
 
         # keep batches moderate for local turnstile (faster than 1, stabler than 15x3)
-        base_count = max(1, min(int(self.cfg.get("register_count") or 8), 15))
+        base_count = max(1, min(int(self.cfg.get("register_count") or 16), 25))
         deficit = max(1, threshold - exportable)
         reg_n = min(base_count, max(deficit, 4))
         retries = max(1, int(self.cfg.get("register_rate_limit_retries") or 3))
@@ -1621,7 +1780,7 @@ class TargetClient:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Delete accounts clearly bad by metadata (no live test needed)."""
-        max_n = max(0, int(self.cfg.get("cleanup_metadata_max") or 100))
+        max_n = max(0, int(self.cfg.get("cleanup_metadata_max") or 500))
         del_unsched = bool(self.cfg.get("cleanup_delete_unschedulable", True))
         del_errmsg = bool(self.cfg.get("cleanup_delete_error_message", True))
         stats: dict[str, Any] = {
@@ -1638,14 +1797,14 @@ class TargetClient:
         pages: list[dict[str, Any]] = []
         for status in ("active", ""):
             try:
-                for page in range(1, 9):
+                for page in range(1, 81):  # full-ish scan
                     rows = self._list_group_page(
                         group_id, status=status, page=page, page_size=50
                     )
                     if not rows:
                         break
                     pages.extend(rows)
-                    if len(pages) >= 400:
+                    if len(pages) >= 5000:
                         break
             except Exception as e:  # noqa: BLE001
                 log.debug("metadata scan status=%s failed: %s", status, e)
@@ -2142,202 +2301,280 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
         result["message"] = f"仅清理完成，当前 {current}"
         return result
 
-    # 分层水位：充足只清理；紧急/正常决定本轮批量
-    if current >= min_count and policy.get("enable_refill", True):
-        # 未达 target 时仍可小批量补（normal）
-        if current >= target_count:
-            result["message"] = f"号池已达目标 ({current} >= {target_count})，本轮不补号"
-            log.info(result["message"])
-            return result
-        # min <= current < target：用 normal_batch
+    # 分层水位 + 紧急多波补号（单轮内 register→import 可连续多波）
+    if current >= target_count and policy.get("enable_refill", True):
+        result["message"] = f"号池已达目标 ({current} >= {target_count})，本轮不补号"
+        log.info(result["message"])
+        return result
+
+    emergency = current < min_count
+    if emergency:
+        batch_cap = max_per
+        # 紧急：单轮内多波，尽快追上消耗
+        max_waves = max(1, int(policy.get("emergency_waves") or 4))
+    elif current < target_count:
         batch_cap = int(policy.get("normal_batch") or max(1, max_per // 2))
+        max_waves = max(1, int(policy.get("normal_waves") or 2))
     else:
         batch_cap = max_per
+        max_waves = 1
 
-    need = max(0, target_count - current)
-    need = min(need, batch_cap) if policy.get("enable_refill", True) else 0
-    result["need"] = need
+    total_need = max(0, target_count - current)
+    result["need"] = total_need
     result["batch_cap"] = batch_cap
-    if need <= 0 and policy.get("enable_refill", True):
+    result["emergency"] = emergency
+    result["max_waves"] = max_waves
+    if total_need <= 0 and policy.get("enable_refill", True):
         result["message"] = "need=0"
         return result
 
-    # ── B1. 本地不足则注册 ────────────────────────────────────────────────
-    buffer = int(src_cfg.get("local_buffer") or 20)
-    min_local = int(src_cfg.get("min_local_active") or 50)
-    pool_target = max(need, min_local) + buffer
-    if policy.get("enable_register", True) and src_cfg.get("auto_register", True):
-        if dry:
-            exp = source.count_exportable(limit=pool_target + 10)
-            result["register"] = {
-                "dry_run": True,
-                "exportable": exp,
-                "would_register": exp < pool_target,
-                "pool_target": pool_target,
-            }
-            log.info("dry-run 注册检查: exportable=%s pool_target=%s", exp, pool_target)
-        else:
+    if not policy.get("enable_refill", True):
+        # register-only path (single wave prep)
+        buffer = int(src_cfg.get("local_buffer") or 20)
+        min_local = int(src_cfg.get("min_local_active") or 40)
+        pool_target = max(min(total_need, batch_cap), min_local) + buffer
+        if policy.get("enable_register", True) and src_cfg.get("auto_register", True):
             try:
                 result["register"] = source.ensure_local_pool(pool_target)
             except Exception as e:  # noqa: BLE001
                 log.exception("本地注册失败: %s", e)
                 result["register"] = {"error": str(e)}
-
-    if not policy.get("enable_refill", True):
         result["message"] = "注册阶段完成（refill 已关闭）"
         return result
 
-    if need <= 0:
-        result["message"] = f"清理后号池充足 current={current}"
-        return result
-
-    log.info("需要补充 %s 个账号 (batch_cap=%s)", need, batch_cap)
-
-    # ── B2–B4 导出 → 转换 → 分片导入 → 绑组 → 再删本地 ──────────────────
-    ids = source.collect_export_ids(
-        need=need,
-        status=src_cfg.get("status") or "active",
-        group=src_cfg.get("group") or "",
-        require_probe_ok=bool(src_cfg.get("require_probe_ok", True)),
-        page_size=int(src_cfg.get("export_batch_size") or 50),
+    log.info(
+        "需要补充 total_need=%s batch_cap=%s waves<=%s emergency=%s",
+        total_need,
+        batch_cap,
+        max_waves,
+        emergency,
     )
-    if not ids:
-        result["message"] = "本地无可用验活账号可导出（注册后仍不足？）"
-        log.warning(result["message"])
-        return result
 
-    log.info("选中本地账号 %s 个", len(ids))
-    export_payload = source.export_by_ids(ids)
-    auth_count = int(export_payload.get("count") or len(export_payload.get("auth") or {}))
-    result["exported"] = auth_count
-    if auth_count <= 0:
-        result["message"] = "导出结果为空"
-        log.warning(result["message"])
-        return result
+    waves: list[dict[str, Any]] = []
+    total_imported = 0
+    total_exported = 0
+    total_failed = 0
+    all_bound: list[int] = []
+    last_register: dict[str, Any] | None = None
+    remaining = min(total_need, batch_cap * max_waves)
 
-    sub2 = convert_export_to_sub2(
-        export_payload,
-        concurrency=int(policy.get("concurrency") or 1),
-        priority=int(policy.get("priority") or 1),
-        rate_multiplier=float(policy.get("rate_multiplier") or 1.0),
+    for wave in range(1, max_waves + 1):
+        wave_need = min(batch_cap, max(0, target_count - (current + total_imported)))
+        # if count API lags, still try to push batch_cap each emergency wave
+        if wave_need <= 0:
+            wave_need = batch_cap if emergency and wave == 1 else 0
+        if wave_need <= 0:
+            break
+
+        log.info("── 补号波次 %s/%s need=%s ──", wave, max_waves, wave_need)
+        wave_info: dict[str, Any] = {"wave": wave, "need": wave_need}
+
+        # register if local short
+        buffer = int(src_cfg.get("local_buffer") or 15)
+        min_local = int(src_cfg.get("min_local_active") or 20)
+        pool_target = max(wave_need, min_local) + buffer
+        if policy.get("enable_register", True) and src_cfg.get("auto_register", True) and not dry:
+            try:
+                reg = source.ensure_local_pool(pool_target)
+                last_register = reg
+                wave_info["register"] = {
+                    "exportable_before": reg.get("exportable_before"),
+                    "exportable_after": reg.get("exportable_after"),
+                    "register_count": reg.get("register_count"),
+                    "early_stop": (reg.get("batch") or {}).get("early_stop"),
+                    "ok_count": (reg.get("batch") or {}).get("ok_count"),
+                    "fail_count": (reg.get("batch") or {}).get("fail_count"),
+                }
+            except Exception as e:  # noqa: BLE001
+                log.exception("波次 %s 注册失败: %s", wave, e)
+                wave_info["register_error"] = str(e)[:200]
+                waves.append(wave_info)
+                # if register hard-fails, stop more waves
+                break
+        elif dry:
+            exp = source.count_exportable(limit=pool_target + 10)
+            wave_info["register"] = {
+                "dry_run": True,
+                "exportable": exp,
+                "would_register": exp < pool_target,
+            }
+
+        ids = source.collect_export_ids(
+            need=wave_need,
+            status=src_cfg.get("status") or "active",
+            group=src_cfg.get("group") or "",
+            require_probe_ok=bool(src_cfg.get("require_probe_ok", True)),
+            page_size=int(src_cfg.get("export_batch_size") or 50),
+        )
+        if not ids:
+            wave_info["exported"] = 0
+            wave_info["message"] = "no exportable"
+            waves.append(wave_info)
+            log.warning("波次 %s 无本地可导出账号", wave)
+            # try next wave only if register might produce more later
+            if not (policy.get("enable_register", True) and src_cfg.get("auto_register", True)):
+                break
+            continue
+
+        log.info("波次 %s 选中本地账号 %s 个", wave, len(ids))
+        export_payload = source.export_by_ids(ids)
+        auth_count = int(export_payload.get("count") or len(export_payload.get("auth") or {}))
+        wave_info["exported"] = auth_count
+        total_exported += auth_count
+        if auth_count <= 0:
+            waves.append(wave_info)
+            continue
+
+        sub2 = convert_export_to_sub2(
+            export_payload,
+            concurrency=int(policy.get("concurrency") or 1),
+            priority=int(policy.get("priority") or 1),
+            rate_multiplier=float(policy.get("rate_multiplier") or 1.0),
+        )
+        accounts = sub2.get("accounts") or []
+        if not accounts:
+            wave_info["message"] = "convert empty"
+            waves.append(wave_info)
+            continue
+
+        dump_dir = SCRIPT_DIR / "exports"
+        dump_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dump_path = dump_dir / f"sub2-import-w{wave}-{len(accounts)}-{stamp}.json"
+        dump_body = {
+            "exported_at": sub2.get("exported_at")
+            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "proxies": [],
+            "accounts": accounts,
+        }
+        with dump_path.open("w", encoding="utf-8") as f:
+            json.dump(dump_body, f, ensure_ascii=False, indent=2)
+        log.info("波次 %s 写出 %s", wave, dump_path)
+
+        if dry:
+            wave_info["dry_run_accounts"] = len(accounts)
+            waves.append(wave_info)
+            # dry-run only one wave
+            break
+
+        # import chunks
+        chunk_size = max(5, int(policy.get("import_chunk_size") or 40))
+        created = 0
+        failed = 0
+        for i in range(0, len(accounts), chunk_size):
+            chunk = accounts[i : i + chunk_size]
+            body = {
+                "exported_at": dump_body["exported_at"],
+                "proxies": [],
+                "accounts": chunk,
+            }
+            try:
+                imp = target.import_data(
+                    body,
+                    skip_default_group_bind=bool(
+                        tgt_cfg.get("skip_default_group_bind", True)
+                    ),
+                )
+                c = int(
+                    imp.get("account_created")
+                    or imp.get("created")
+                    or imp.get("success")
+                    or 0
+                )
+                f = int(imp.get("account_failed") or imp.get("failed") or 0)
+                created += c
+                failed += f
+                log.info(
+                    "波次 %s 导入 %s-%s created=%s failed=%s",
+                    wave,
+                    i,
+                    i + len(chunk),
+                    c,
+                    f,
+                )
+            except Exception as e:  # noqa: BLE001
+                failed += len(chunk)
+                log.error("波次 %s 导入失败 offset=%s: %s", wave, i, e)
+
+        total_imported += created
+        total_failed += failed
+        wave_info["imported"] = created
+        wave_info["failed"] = failed
+
+        # bind
+        bound_ids: list[int] = []
+        bind_ok = False
+        want_bind = bool(tgt_cfg.get("bind_group_after_import")) and group_id is not None
+        if want_bind:
+            emails = [
+                str((a.get("credentials") or {}).get("email") or a.get("name") or "")
+                for a in accounts
+            ]
+            emails = [e for e in emails if e]
+            new_ids = target.list_recent_account_ids(
+                group_id=None,
+                limit=len(emails),
+                search_emails=emails,
+            )
+            if new_ids:
+                bind_res = target.bulk_bind_group(new_ids, int(group_id))
+                log.info(
+                    "波次 %s 绑定 group_id=%s n=%s res=%s",
+                    wave,
+                    group_id,
+                    len(new_ids),
+                    bind_res,
+                )
+                bound_ids = new_ids
+                bind_ok = True
+                all_bound.extend(new_ids)
+            else:
+                log.warning("波次 %s 未能定位新账号 id 绑组", wave)
+        else:
+            bind_ok = True
+
+        wave_info["bound"] = len(bound_ids)
+        wave_info["bind_ok"] = bind_ok
+
+        only_after_bind = bool(src_cfg.get("delete_only_after_bind", True))
+        can_delete = bool(src_cfg.get("delete_after_export")) and ids and created > 0
+        if can_delete:
+            if only_after_bind and want_bind and not bind_ok:
+                log.warning("波次 %s 绑组失败，跳过本地删除", wave)
+                wave_info["deleted_local"] = {"skipped": True}
+            else:
+                del_res = source.delete_accounts(ids[:auth_count])
+                log.info("波次 %s 本地删除: %s", wave, del_res)
+                wave_info["deleted_local"] = del_res
+
+        waves.append(wave_info)
+
+        # stop waves if little progress
+        if created <= 0:
+            log.warning("波次 %s 导入 0，停止后续波次", wave)
+            break
+        # if not emergency, one solid wave may be enough
+        if not emergency and total_imported >= batch_cap:
+            break
+
+    result["waves"] = waves
+    result["wave_count"] = len(waves)
+    result["exported"] = total_exported
+    result["imported"] = total_imported
+    result["failed"] = total_failed
+    result["bound_ids"] = all_bound
+    result["bind_ok"] = bool(all_bound) or not bool(
+        tgt_cfg.get("bind_group_after_import")
     )
-    issues = (sub2.get("_meta") or {}).get("issues") or []
-    for iss in issues[:10]:
-        log.warning("convert issue: %s", iss)
-    accounts = sub2.get("accounts") or []
-    if not accounts:
-        result["message"] = "转换后无账号"
-        return result
-
-    dump_dir = SCRIPT_DIR / "exports"
-    dump_dir.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dump_path = dump_dir / f"sub2-import-{len(accounts)}-{stamp}.json"
-    dump_body = {
-        "exported_at": sub2["exported_at"],
-        "proxies": [],
-        "accounts": accounts,
-    }
-    with dump_path.open("w", encoding="utf-8") as f:
-        json.dump(dump_body, f, ensure_ascii=False, indent=2)
-    log.info("已写出转换文件 %s", dump_path)
+    result["register"] = last_register
 
     if dry:
         result["message"] = (
-            f"dry-run: 清理后 current={current}; 将导入 {len(accounts)} → group_id={group_id}"
+            f"dry-run: current={current}; waves={len(waves)} "
+            f"would_export≈{total_exported}"
         )
         log.info(result["message"])
         return result
-
-    # 分片导入
-    chunk_size = max(5, int(policy.get("import_chunk_size") or 25))
-    created = 0
-    failed = 0
-    import_chunks: list[dict[str, Any]] = []
-    for i in range(0, len(accounts), chunk_size):
-        chunk = accounts[i : i + chunk_size]
-        body = {
-            "exported_at": dump_body["exported_at"],
-            "proxies": [],
-            "accounts": chunk,
-        }
-        try:
-            imp = target.import_data(
-                body,
-                skip_default_group_bind=bool(tgt_cfg.get("skip_default_group_bind", True)),
-            )
-            c = int(
-                imp.get("account_created")
-                or imp.get("created")
-                or imp.get("success")
-                or 0
-            )
-            f = int(imp.get("account_failed") or imp.get("failed") or 0)
-            created += c
-            failed += f
-            import_chunks.append({"offset": i, "size": len(chunk), "created": c, "failed": f})
-            log.info("导入分片 %s-%s: created=%s failed=%s", i, i + len(chunk), c, f)
-        except Exception as e:  # noqa: BLE001
-            failed += len(chunk)
-            import_chunks.append({"offset": i, "size": len(chunk), "error": str(e)[:200]})
-            log.error("导入分片失败 offset=%s: %s", i, e)
-
-    result["imported"] = created
-    result["failed"] = failed
-    result["import_chunks"] = import_chunks
-    log.info("导入汇总: created=%s failed=%s chunks=%s", created, failed, len(import_chunks))
-
-    # 绑组
-    bound_ids: list[int] = []
-    bind_missed: list[str] = []
-    bind_ok = False
-    want_bind = bool(tgt_cfg.get("bind_group_after_import")) and group_id is not None
-    if want_bind:
-        emails = [
-            str((a.get("credentials") or {}).get("email") or a.get("name") or "")
-            for a in accounts
-        ]
-        emails = [e for e in emails if e]
-        new_ids = target.list_recent_account_ids(
-            group_id=None,
-            limit=len(emails),
-            search_emails=emails,
-        )
-        # 记录未命中邮箱
-        #（粗略：命中数 < 邮箱数）
-        if new_ids:
-            bind_res = target.bulk_bind_group(new_ids, int(group_id))
-            log.info("绑定分组 group_id=%s ids=%s res=%s", group_id, len(new_ids), bind_res)
-            bound_ids = new_ids
-            bind_ok = True
-            if len(new_ids) < len(emails):
-                bind_missed = emails[len(new_ids) :]
-                log.warning("部分邮箱未定位到 id，miss≈%s", len(bind_missed))
-        else:
-            bind_missed = emails
-            log.warning(
-                "未能按邮箱定位新账号 id，请在后台确认是否已绑定到分组 %s",
-                group_id,
-            )
-    else:
-        # 明确不绑组时，视为可删本地（若开启 delete_after_export）
-        bind_ok = True
-
-    result["bound_ids"] = bound_ids
-    result["bind_ok"] = bind_ok
-    result["bind_missed"] = bind_missed[:50]
-
-    # 仅在绑组成功（或无需绑）后删本地，避免丢号
-    only_after_bind = bool(src_cfg.get("delete_only_after_bind", True))
-    can_delete = bool(src_cfg.get("delete_after_export")) and ids and created > 0
-    if can_delete:
-        if only_after_bind and want_bind and not bind_ok:
-            log.warning("绑组未成功，跳过本地删除（防止丢号）")
-            result["deleted_local"] = {"skipped": True, "reason": "bind_failed"}
-        else:
-            del_res = source.delete_accounts(ids[:auth_count])
-            log.info("本地删除导出账号: %s", del_res)
-            result["deleted_local"] = del_res
 
     after = target.count_group_accounts(group_id)
     result["after"] = after

@@ -97,6 +97,9 @@ class WorkerState:
         self.finished_at: float | None = None
         self.cycle_count = 0
         self.config_path = core.DEFAULT_CONFIG
+        self.reg_health_thread = None
+        self.reg_health_stop = threading.Event()
+        self.last_reg_health = None
 
 
 WORKER = WorkerState()
@@ -189,6 +192,7 @@ def public_status() -> dict[str, Any]:
                 "max_per_cycle": policy.get("max_per_cycle"),
                 "interval_sec": policy.get("interval_sec"),
             },
+            "reg_health": WORKER.last_reg_health,
             "snapshot": {
                 "current": (last or {}).get("current") or (last or {}).get("after"),
                 "after": (last or {}).get("after"),
@@ -352,6 +356,86 @@ def loop_worker() -> None:
         except Exception:
             pass
         log.info("循环线程已停止")
+
+
+
+
+def _jsonable(obj):
+    """Best-effort convert health result to plain JSON types."""
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(x) for x in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def run_reg_health_once(auto_fix: bool = True) -> dict:
+    """Run one registration-machine health check using current config."""
+    cfg = load_cfg()
+    src = core.SourceClient(cfg["source"])
+    src.login()
+    result = _jsonable(src.check_registration_health(auto_fix=auto_fix))
+    with WORKER.lock:
+        WORKER.last_reg_health = result
+    if result.get("ok"):
+        log.info("注册机定时自检通过: %s", result.get("message"))
+    else:
+        log.error("注册机定时自检失败: %s", result.get("message"))
+    if result.get("fixes"):
+        log.warning("注册机自动修复: %s", result.get("fixes"))
+    return result
+
+
+def reg_health_worker() -> None:
+    log.info("注册机定时自检线程启动")
+    while not WORKER.reg_health_stop.is_set():
+        try:
+            cfg = load_cfg()
+            interval = max(
+                60,
+                int(
+                    (cfg.get("source") or {}).get("register_health_interval_sec")
+                    or 120
+                ),
+            )
+            if (cfg.get("source") or {}).get("register_health_check", True):
+                try:
+                    run_reg_health_once(auto_fix=True)
+                except Exception as e:
+                    log.warning("注册机定时自检异常: %s", e)
+                    with WORKER.lock:
+                        WORKER.last_reg_health = {
+                            "ok": False,
+                            "message": f"health check exception: {e}",
+                            "ts": time.time(),
+                        }
+            for _ in range(interval):
+                if WORKER.reg_health_stop.is_set():
+                    break
+                time.sleep(1)
+        except Exception as e:
+            log.warning("reg health worker loop error: %s", e)
+            time.sleep(5)
+    log.info("注册机定时自检线程已停止")
+
+
+def ensure_reg_health_timer() -> None:
+    with WORKER.lock:
+        th = WORKER.reg_health_thread
+        if th is not None and th.is_alive():
+            return
+        WORKER.reg_health_stop.clear()
+        WORKER.reg_health_thread = threading.Thread(
+            target=reg_health_worker, daemon=True, name="reg-health"
+        )
+        WORKER.reg_health_thread.start()
 
 
 # ── FastAPI ────────────────────────────────────────────────────────────────
@@ -572,6 +656,36 @@ def api_test_login(body: LoginTestBody) -> dict[str, Any]:
     return out
 
 
+
+
+@app.get("/api/reg-health")
+def api_reg_health_get() -> dict:
+    with WORKER.lock:
+        last = WORKER.last_reg_health
+    return {"ok": True, "last": last}
+
+
+@app.post("/api/reg-health")
+def api_reg_health_run() -> dict:
+    try:
+        result = run_reg_health_once(auto_fix=True)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        log.exception("manual reg health failed")
+        raise HTTPException(500, str(e)) from e
+
+
+@app.post("/api/reg-health/timer/start")
+def api_reg_health_timer_start() -> dict:
+    ensure_reg_health_timer()
+    return {"ok": True, "message": "注册机定时自检已启动"}
+
+
+@app.post("/api/reg-health/timer/stop")
+def api_reg_health_timer_stop() -> dict:
+    WORKER.reg_health_stop.set()
+    return {"ok": True, "message": "注册机定时自检已停止"}
+
 @app.get("/api/history")
 def api_history(limit: int = 20) -> JSONResponse:
     state = core.load_json(core.STATE_FILE)
@@ -756,6 +870,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
       <div class="row">
         <button onclick="testLogin()">测试两边登录</button>
         <button class="warn" onclick="fixLocal()">急救：停卡死注册</button>
+        <button onclick="checkRegHealth()">检查注册机</button>
         <button class="ghost" onclick="refreshAll()">刷新状态</button>
         <button class="ghost" onclick="clearLogView()">清空日志视图</button>
       </div>
@@ -1246,6 +1361,26 @@ async function fixLocal() {
     await refreshAll();
   } catch (e) {
     toast("急救失败: " + e.message, false);
+  } finally {
+    setActionBusy(false);
+  }
+}
+
+
+async function checkRegHealth() {
+  try {
+    setActionBusy(true, "正在检查注册机…");
+    const r = await api("/api/reg-health", { method: "POST", body: "{}" });
+    const res = r.result || {};
+    const ok = !!res.ok;
+    const msg = res.message || (ok ? "注册机正常" : "注册机异常");
+    toast(msg, ok);
+    if (res.issues && res.issues.length) {
+      console.warn("reg health issues", res.issues);
+    }
+    await refreshAll();
+  } catch (e) {
+    toast("注册机检查失败: " + e.message, false);
   } finally {
     setActionBusy(false);
   }
