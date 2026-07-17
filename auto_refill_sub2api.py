@@ -299,6 +299,10 @@ def default_config() -> dict[str, Any]:
             "register_settle_sec": 12,
             # 注册前检查本地是否过载；过载则跳过本轮注册
             "register_health_gate": True,
+            # 注册前先本地续期+探测，尽量救活闲置号
+            "recover_local_refresh": True,
+            "recover_local_probe": True,
+            "recover_local_quota": True,
             "register_max_active_sessions": 10,
             # rate_limited 退避
             "register_rate_limit_retries": 3,
@@ -339,6 +343,10 @@ def default_config() -> dict[str, Any]:
             # 同一账号连续失败几轮才删除（1=立刻删）
             "cleanup_fail_streak": 2,
             "cleanup_delete_unschedulable": True,
+            # 回收策略：临时不可调度/限流先不删；续期探测失败后再删
+            "recover_skip_temp_unsched": True,
+            "recover_retest_before_delete": True,
+            "recover_max_candidates": 80,
             "cleanup_delete_error_message": True,
             "cleanup_metadata_max": 500,
             # 游标改存 .auto_refill_state.json（此处仅兼容读旧配置）
@@ -363,6 +371,7 @@ def default_config() -> dict[str, Any]:
             "dry_run": False,
             # 阶段开关
             "enable_cleanup": True,
+            "enable_recover": True,
             "enable_register": True,
             "enable_refill": True,
             # 注册不等待整批完成（只触发；下轮再导出）
@@ -787,6 +796,144 @@ class SourceClient:
         )
         return len(ids)
 
+
+
+    def refresh_accounts(
+        self,
+        ids: list[str] | None = None,
+        *,
+        force: bool = True,
+    ) -> dict[str, Any]:
+        """POST /admin/api/accounts/refresh — renew access tokens via refresh_token."""
+        body: dict[str, Any] = {"force": bool(force)}
+        if ids:
+            body["ids"] = [str(x) for x in ids if str(x).strip()]
+        r = self.s.post(
+            f"{self.base}/admin/api/accounts/refresh",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json=body,
+            timeout=180,
+        )
+        if r.status_code >= 400:
+            log.warning("local refresh failed %s: %s", r.status_code, r.text[:300])
+            return {"ok": False, "status": r.status_code, "error": r.text[:300]}
+        return r.json() if r.content else {"ok": True}
+
+    def probe_accounts(
+        self,
+        ids: list[str] | None = None,
+        *,
+        auto_disable: bool = False,
+    ) -> dict[str, Any]:
+        """Probe selected accounts or all accounts."""
+        if ids:
+            body = {
+                "ids": [str(x) for x in ids if str(x).strip()],
+                "auto_disable": bool(auto_disable),
+            }
+            r = self.s.post(
+                f"{self.base}/admin/api/accounts/probe-batch",
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json=body,
+                timeout=300,
+            )
+        else:
+            r = self.s.post(
+                f"{self.base}/admin/api/accounts/probe-all",
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json={"auto_disable": bool(auto_disable)},
+                timeout=600,
+            )
+        if r.status_code >= 400:
+            log.warning("local probe failed %s: %s", r.status_code, r.text[:300])
+            return {"ok": False, "status": r.status_code, "error": r.text[:300]}
+        return r.json() if r.content else {"ok": True}
+
+    def fetch_quota(self, *, cached: bool = True) -> dict[str, Any]:
+        r = self.s.get(
+            f"{self.base}/admin/api/accounts/quota",
+            params={"cached": 1 if cached else 0},
+            headers=self._headers(),
+            timeout=120,
+        )
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "error": r.text[:200]}
+        return r.json() if r.content else {"ok": True}
+
+    def recover_local_pool(self) -> dict[str, Any]:
+        """Refresh + probe local accounts so idle tokens become exportable again."""
+        out: dict[str, Any] = {
+            "refresh": None,
+            "probe": None,
+            "quota": None,
+            "exportable_before": 0,
+            "exportable_after": 0,
+        }
+        out["exportable_before"] = self.count_exportable(limit=200)
+        if self.cfg.get("recover_local_refresh", True):
+            try:
+                ref = self.refresh_accounts(force=True)
+                out["refresh"] = {
+                    "ok": ref.get("ok", True),
+                    "refreshed": (ref.get("refresh") or ref).get("refreshed")
+                    if isinstance(ref.get("refresh") or ref, dict)
+                    else None,
+                    "failed": (ref.get("refresh") or ref).get("failed")
+                    if isinstance(ref.get("refresh") or ref, dict)
+                    else None,
+                    "attempted": (ref.get("refresh") or ref).get("attempted")
+                    if isinstance(ref.get("refresh") or ref, dict)
+                    else None,
+                }
+                # also flatten common fields
+                if isinstance(ref, dict):
+                    out["refresh"]["refreshed"] = (
+                        out["refresh"].get("refreshed")
+                        or ref.get("refreshed")
+                        or (ref.get("refresh") or {}).get("refreshed")
+                    )
+                    out["refresh"]["failed"] = (
+                        out["refresh"].get("failed")
+                        or ref.get("failed")
+                        or (ref.get("refresh") or {}).get("failed")
+                    )
+                log.info("本地续期: %s", out["refresh"])
+            except Exception as e:  # noqa: BLE001
+                out["refresh"] = {"ok": False, "error": str(e)[:200]}
+                log.warning("本地续期异常: %s", e)
+        if self.cfg.get("recover_local_probe", True):
+            try:
+                pr = self.probe_accounts(auto_disable=False)
+                out["probe"] = {
+                    "ok": pr.get("ok", True),
+                    "count": pr.get("count"),
+                    "available_count": pr.get("available_count"),
+                    "unavailable_count": pr.get("unavailable_count"),
+                }
+                log.info("本地探测: %s", out["probe"])
+            except Exception as e:  # noqa: BLE001
+                out["probe"] = {"ok": False, "error": str(e)[:200]}
+                log.warning("本地探测异常: %s", e)
+        if self.cfg.get("recover_local_quota", True):
+            try:
+                q = self.fetch_quota(cached=False)
+                out["quota"] = {
+                    "ok": q.get("ok", True),
+                    "count": q.get("count"),
+                    "ok_count": q.get("ok_count"),
+                    "exhausted_count": q.get("exhausted_count"),
+                    "active_ok_count": q.get("active_ok_count"),
+                }
+                log.info("本地额度: %s", out["quota"])
+            except Exception as e:  # noqa: BLE001
+                out["quota"] = {"ok": False, "error": str(e)[:200]}
+        # short settle for pool meta flush
+        interruptible_sleep(2)
+        out["exportable_after"] = self.count_exportable(limit=200)
+        out["message"] = (
+            f"local recover exportable {out['exportable_before']}→{out['exportable_after']}"
+        )
+        return out
 
     def check_registration_health(self, *, auto_fix: bool = True) -> dict[str, Any]:
         """Health-check local registration machine; optionally fix stuck sessions."""
@@ -1748,16 +1895,23 @@ class TargetClient:
 
 
     def _account_unusable_reason(self, acc: dict[str, Any]) -> str | None:
-        """Heuristic: account clearly unusable from list metadata."""
+        """Heuristic hard-unusable only (temp unsched/rate-limit excluded)."""
         if not isinstance(acc, dict):
             return None
+        # temporary conditions: never metadata-delete
+        if self._is_temp_unusable(acc):
+            return None
         status = str(acc.get("status") or "").lower()
-        if status in {"inactive", "error", "expired", "disabled", "quota_exhausted", "banned", "invalid"}:
+        if status in {"error", "expired", "disabled", "banned", "invalid"}:
             return f"status={status}"
-        if acc.get("schedulable") is False:
-            return "not_schedulable"
+        # pure not_schedulable without hard error -> leave to recover_remote retest
+        if acc.get("schedulable") is False and not self._is_hard_dead(acc):
+            return None
+        if self._is_hard_dead(acc):
+            err = acc.get("error_message") or acc.get("last_error") or acc.get("error") or "hard_dead"
+            return f"hard_dead:{str(err)[:80]}"
         err = acc.get("error_message") or acc.get("last_error") or acc.get("error")
-        if err:
+        if err and self._is_hard_dead(acc):
             msg = str(err).strip()
             if msg:
                 return f"error_message:{msg[:80]}"
@@ -1772,6 +1926,272 @@ class TargetClient:
         except Exception:
             pass
         return None
+
+
+    def list_all_group_accounts(
+        self,
+        group_id: int | None,
+        *,
+        status: str = "",
+        max_pages: int = 40,
+        page_size: int = 50,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for page in range(1, max_pages + 1):
+            rows = self._list_group_page(
+                group_id, status=status, page=page, page_size=page_size
+            )
+            if not rows:
+                break
+            for a in rows:
+                if not isinstance(a, dict) or a.get("id") is None:
+                    continue
+                aid = int(a["id"])
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                items.append(a)
+            if len(rows) < page_size:
+                break
+        return items
+
+    def _is_temp_unusable(self, acc: dict[str, Any]) -> bool:
+        """True if account looks temporarily unusable (rate limit / short unsched)."""
+        if not isinstance(acc, dict):
+            return False
+        if acc.get("rate_limited_at") or acc.get("rate_limit_reset_at"):
+            return True
+        reason = str(acc.get("temp_unschedulable_reason") or "").lower()
+        if reason and any(
+            x in reason for x in ("rate", "limit", "cooldown", "overload", "temp", "quota")
+        ):
+            return True
+        until = acc.get("temp_unschedulable_until")
+        if until:
+            try:
+                ts = float(until)
+                if ts > 1e12:
+                    ts /= 1000.0
+                # still in temporary window
+                if ts > time.time():
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _is_hard_dead(self, acc: dict[str, Any]) -> bool:
+        """True if metadata strongly suggests permanent death."""
+        if not isinstance(acc, dict):
+            return False
+        status = str(acc.get("status") or "").lower()
+        if status in {"error", "expired", "disabled", "banned", "invalid"}:
+            return True
+        err = str(acc.get("error_message") or acc.get("last_error") or acc.get("error") or "").lower()
+        if not err:
+            return False
+        hard_kw = (
+            "invalid_grant",
+            "refresh",
+            "revoked",
+            "banned",
+            "disabled",
+            "unauthorized",
+            "invalid_token",
+            "expired",
+            "not found",
+            "account suspended",
+        )
+        return any(k in err for k in hard_kw)
+
+    def recover_remote_group(
+        self,
+        group_id: int | None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Classify remote accounts; retest salvageable; delete only hard-dead / recover-failed.
+
+        Strategy:
+          - temp unsched / rate-limit: skip delete (wait natural recovery)
+          - hard-dead metadata: delete (or count in dry_run)
+          - not_schedulable without hard error: remote test; fail streak then delete
+          - healthy active: keep
+        """
+        skip_temp = bool(self.cfg.get("recover_skip_temp_unsched", True))
+        retest = bool(self.cfg.get("recover_retest_before_delete", True))
+        max_cand = max(0, int(self.cfg.get("recover_max_candidates") or 80))
+        need_streak = max(1, int(self.cfg.get("cleanup_fail_streak") or 2))
+        do_delete_unsched = bool(self.cfg.get("cleanup_delete_unschedulable", True))
+        do_delete_errmsg = bool(self.cfg.get("cleanup_delete_error_message", True))
+
+        stats: dict[str, Any] = {
+            "scanned": 0,
+            "healthy": 0,
+            "temp_skipped": 0,
+            "hard_dead": 0,
+            "retested": 0,
+            "recovered": 0,
+            "deleted": 0,
+            "delete_failed": 0,
+            "soft_kept": 0,
+            "candidates": [],
+            "dry_run": dry_run,
+        }
+        accounts = self.list_all_group_accounts(group_id, status="", max_pages=40)
+        # merge active scan
+        for a in self.list_all_group_accounts(group_id, status="active", max_pages=40):
+            accounts.append(a)
+        # unique
+        seen: set[int] = set()
+        uniq: list[dict[str, Any]] = []
+        for a in accounts:
+            if not isinstance(a, dict) or a.get("id") is None:
+                continue
+            aid = int(a["id"])
+            if aid in seen:
+                continue
+            seen.add(aid)
+            uniq.append(a)
+        accounts = uniq
+        stats["scanned"] = len(accounts)
+        streaks = get_fail_streaks()
+
+        salvage: list[dict[str, Any]] = []
+        hard: list[dict[str, Any]] = []
+        for acc in accounts:
+            aid = int(acc["id"])
+            name = acc.get("name") or acc.get("email") or aid
+            sched = acc.get("schedulable")
+            hard_dead = self._is_hard_dead(acc)
+            temp = self._is_temp_unusable(acc)
+            if sched is not False and not hard_dead and not acc.get("error_message"):
+                stats["healthy"] += 1
+                # clear streak on healthy
+                streaks.pop(str(aid), None)
+                continue
+            if temp and skip_temp and not hard_dead:
+                stats["temp_skipped"] += 1
+                stats["candidates"].append(
+                    {"id": aid, "name": name, "action": "skip_temp", "reason": "temp_unsched/rate_limit"}
+                )
+                continue
+            if hard_dead and do_delete_errmsg:
+                hard.append(acc)
+                continue
+            if sched is False and do_delete_unsched:
+                salvage.append(acc)
+                continue
+            if acc.get("error_message") and do_delete_errmsg:
+                if hard_dead:
+                    hard.append(acc)
+                else:
+                    salvage.append(acc)
+
+        # delete hard-dead first
+        for acc in hard[:max_cand]:
+            aid = int(acc["id"])
+            name = acc.get("name") or acc.get("email") or aid
+            stats["hard_dead"] += 1
+            if dry_run:
+                stats["candidates"].append(
+                    {"id": aid, "name": name, "action": "would_delete_hard", "reason": "hard_dead"}
+                )
+                continue
+            d = self.delete_account(aid)
+            if d.get("ok"):
+                stats["deleted"] += 1
+                streaks.pop(str(aid), None)
+                log.info("回收删除真死号 id=%s name=%s", aid, name)
+            else:
+                stats["delete_failed"] += 1
+            stats["candidates"].append(
+                {"id": aid, "name": name, "action": "delete_hard", "ok": d.get("ok")}
+            )
+
+        # retest salvageable
+        for acc in salvage[: max(0, max_cand - stats["hard_dead"])]:
+            aid = int(acc["id"])
+            name = acc.get("name") or acc.get("email") or aid
+            key = str(aid)
+            if retest and not dry_run:
+                stats["retested"] += 1
+                try:
+                    t = self.test_account(aid)
+                except Exception as e:  # noqa: BLE001
+                    t = {"ok": False, "message": str(e)[:200], "http_status": 0}
+                if t.get("ok"):
+                    stats["recovered"] += 1
+                    streaks.pop(key, None)
+                    stats["candidates"].append(
+                        {"id": aid, "name": name, "action": "recovered_by_test"}
+                    )
+                    log.info("远程回收成功(复测ok) id=%s name=%s", aid, name)
+                    continue
+                streaks[key] = int(streaks.get(key) or 0) + 1
+                streak_n = streaks[key]
+                if streak_n < need_streak:
+                    stats["soft_kept"] += 1
+                    stats["candidates"].append(
+                        {
+                            "id": aid,
+                            "name": name,
+                            "action": "soft_keep",
+                            "streak": streak_n,
+                            "msg": (t.get("message") or "")[:80],
+                        }
+                    )
+                    continue
+                # delete after repeated recover fail
+                d = self.delete_account(aid)
+                if d.get("ok"):
+                    stats["deleted"] += 1
+                    streaks.pop(key, None)
+                    log.info(
+                        "回收失败达 streak=%s，删除 id=%s name=%s",
+                        streak_n,
+                        aid,
+                        name,
+                    )
+                else:
+                    stats["delete_failed"] += 1
+                stats["candidates"].append(
+                    {
+                        "id": aid,
+                        "name": name,
+                        "action": "delete_after_recover_fail",
+                        "streak": streak_n,
+                        "ok": d.get("ok"),
+                    }
+                )
+            else:
+                # dry-run or no retest: count only
+                stats["candidates"].append(
+                    {
+                        "id": aid,
+                        "name": name,
+                        "action": "would_retest" if dry_run else "no_retest",
+                        "schedulable": acc.get("schedulable"),
+                        "error_message": str(acc.get("error_message") or "")[:60],
+                    }
+                )
+
+        if not dry_run:
+            set_fail_streaks(streaks)
+        # trim candidates for state size
+        stats["candidates"] = stats["candidates"][:80]
+        log.info(
+            "远程回收: scanned=%s healthy=%s temp_skip=%s hard=%s retested=%s recovered=%s deleted=%s soft_kept=%s",
+            stats["scanned"],
+            stats["healthy"],
+            stats["temp_skipped"],
+            stats["hard_dead"],
+            stats["retested"],
+            stats["recovered"],
+            stats["deleted"],
+            stats["soft_kept"],
+        )
+        return stats
 
     def cleanup_unusable_metadata(
         self,
@@ -2264,6 +2684,33 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
     }
 
     # ── A. 远程测活清理 ───────────────────────────────────────────────────
+        # ── A0. 本地回收：续期 + 探测 + 额度（减少重复注册）────────────────
+    if policy.get("enable_recover", True):
+        try:
+            if dry:
+                result["recover_local"] = {
+                    "dry_run": True,
+                    "exportable": source.count_exportable(limit=100),
+                }
+            else:
+                result["recover_local"] = source.recover_local_pool()
+        except Exception as e:  # noqa: BLE001
+            log.exception("本地回收失败: %s", e)
+            result["recover_local"] = {"error": str(e)}
+    else:
+        result["recover_local"] = {"skipped": True}
+
+    # ── A1. 远程回收：临时不可调度跳过；复测；只删真死号 ───────────────
+    if policy.get("enable_recover", True) and tgt_cfg.get("cleanup_bad", True):
+        try:
+            result["recover_remote"] = target.recover_remote_group(group_id, dry_run=dry)
+        except Exception as e:  # noqa: BLE001
+            log.exception("远程回收失败: %s", e)
+            result["recover_remote"] = {"error": str(e)}
+    else:
+        result["recover_remote"] = {"skipped": True}
+
+    # ── A2. 远程测活清理（抽样 + 元数据硬删除）──────────────────────────
     if policy.get("enable_cleanup", True) and tgt_cfg.get("cleanup_bad", True):
         try:
             # cursor 由 cleanup_bad_accounts 写入 STATE_FILE，不再写含密 config
@@ -2272,7 +2719,7 @@ def run_cycle(cfg: dict[str, Any], source: SourceClient, target: TargetClient) -
             result["cleanup"] = {
                 "metadata": meta,
                 "live_test": live,
-                "deleted": int(meta.get("deleted") or 0) + int(live.get("deleted") or 0),
+                "deleted": int(meta.get("deleted") or 0) + int(live.get("deleted") or 0) + int((result.get("recover_remote") or {}).get("deleted") or 0),
                 "tested": live.get("tested"),
                 "ok": live.get("ok"),
                 "bad": live.get("bad"),

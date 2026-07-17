@@ -511,7 +511,7 @@ def api_run(body: RunBody) -> dict[str, Any]:
         if WORKER.running:
             raise HTTPException(409, "循环模式运行中，请先停止再单轮执行")
     kind = (body.kind or "full").lower()
-    if kind not in ("full", "cleanup", "register", "refill"):
+    if kind not in ("full", "cleanup", "register", "refill", "recover"):
         raise HTTPException(400, f"unknown kind: {kind}")
     overrides: dict[str, Any] = {}
     if body.dry_run:
@@ -862,6 +862,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
         <button class="primary" id="btn-run-full" onclick="run('full')">执行完整闭环（一轮）</button>
       </div>
       <div class="row">
+        <button class="warn" onclick="run('recover')">回收废号(续期/探测)</button>
         <button class="warn" onclick="run('cleanup')">仅清理远程坏号</button>
         <button onclick="run('register')">仅本地注册（快速）</button>
         <button onclick="run('refill')">仅补号（含注册）</button>
@@ -1263,7 +1264,7 @@ function clearLogView() {
 
 async function run(kind, forceDry) {
   const dry = forceDry || $("opt-dry").checked;
-  const names = { full: "完整闭环", cleanup: "仅清理坏号", register: "仅本地注册", refill: "仅补号" };
+  const names = { full: "完整闭环", recover: "回收废号", cleanup: "仅清理坏号", register: "仅本地注册", refill: "仅补号" };
   try {
     setActionBusy(true, `启动任务：${names[kind] || kind}${dry ? "（模拟）" : ""}…`);
     await api("/api/run", {
